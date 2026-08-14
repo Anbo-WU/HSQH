@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors and office lock files
+.idea/
+.vscode/
+~$*
+.~*
+
+# Temporary files created during processing
+*.tmp
+.*.tmp.xls
