@@ -23,13 +23,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-PDF_FOLDER_NAME = "确认书扫描"
-
 # 不依赖 OCR 必须准确识别书名号和 HFSY，只严格提取核心结构。
 TRANSACTION_PATTERN = re.compile(
-    r"(?<!\d)(\d{4})\s*[-‐‑‒–—−]?\s*"
-    r"(FWJY|JY)\s*[-‐‑‒–—−]?\s*(\d{10})(?!\d)",
+    r"(?<![0-9A-Z])([0-9OQILSZBGD|]{4})\s*[-‐‑‒–—−]?\s*"
+    r"(FWJY|JY)\s*[-‐‑‒–—−]?\s*([0-9OQILSZBGD|]{10})(?![0-9A-Z])",
     flags=re.IGNORECASE,
+)
+
+OCR_DIGIT_TRANSLATION = str.maketrans(
+    {"O": "0", "Q": "0", "D": "0", "I": "1", "L": "1", "|": "1", "Z": "2", "S": "5", "G": "6", "B": "8"}
 )
 
 
@@ -107,6 +109,7 @@ class RenamePlan:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("folder", type=Path, help="要识别并重命名的确认书扫描目录")
     parser.add_argument(
         "--preview",
         action="store_true",
@@ -208,6 +211,10 @@ def extract_transaction_number(text: str, pdf_name: str) -> str:
         raise ValueError(f"{pdf_name}: {detail}")
 
     company_code, trade_type, serial = matches.pop()
+    company_code = company_code.upper().translate(OCR_DIGIT_TRANSLATION)
+    serial = serial.upper().translate(OCR_DIGIT_TRANSLATION)
+    if not (company_code.isdigit() and serial.isdigit()):
+        raise ValueError(f"{pdf_name}: 交易编号数字字段包含无法纠正的字符")
     return f"【HFSY】{company_code}-{trade_type}-{serial}"
 
 
@@ -277,30 +284,21 @@ def apply_plans(plans: list[RenamePlan]) -> None:
         raise
 
 
-def main() -> int:
-    args = parse_args()
-    base_folder = Path(__file__).resolve().parent
-    pdf_folder = base_folder / PDF_FOLDER_NAME
-
+def run_scan(pdf_folder: Path, preview: bool = False) -> tuple[int, int]:
+    """识别并重命名扫描件，返回（PDF 总数，实际改名数量）。"""
+    pdf_folder = pdf_folder.expanduser().resolve()
     if sys.platform != "darwin":
-        print("本脚本使用 macOS Vision OCR，需要在 Mac 上运行。", file=sys.stderr)
-        return 1
+        raise RuntimeError("本脚本使用 macOS Vision OCR，需要在 Mac 上运行。")
     if not pdf_folder.is_dir():
-        print(f"找不到文件夹：{pdf_folder}", file=sys.stderr)
-        return 1
+        raise RuntimeError(f"找不到文件夹：{pdf_folder}")
 
     pdfs = collect_pdfs(pdf_folder)
     if not pdfs:
-        print(f"未在 {pdf_folder} 中找到 PDF。", file=sys.stderr)
-        return 1
+        raise RuntimeError(f"未在 {pdf_folder} 中找到 PDF。")
 
     print(f"正在识别 {len(pdfs)} 份 PDF 的首页，请稍候……")
-    try:
-        recognized = recognize_all(pdfs)
-        plans = build_plans(pdfs, recognized)
-    except (OSError, RuntimeError) as exc:
-        print(f"\n已停止，未重命名任何文件：\n{exc}", file=sys.stderr)
-        return 1
+    recognized = recognize_all(pdfs)
+    plans = build_plans(pdfs, recognized)
 
     print()
     for number, plan in enumerate(plans, start=1):
@@ -308,19 +306,25 @@ def main() -> int:
         print(f"{number:>3}. {plan.source.name}")
         print(f"     -> {plan.target.name}{status}")
 
-    if args.preview:
+    if preview:
         print(f"\n预览完成：共 {len(plans)} 份，未重命名任何文件。")
-        return 0
+        return len(plans), 0
 
-    try:
-        apply_plans(plans)
-    except OSError as exc:
-        print(f"\n重命名失败，已尝试恢复原名：{exc}", file=sys.stderr)
-        return 1
+    apply_plans(plans)
 
     changed = sum(plan.source != plan.target for plan in plans)
     print(f"\n已完成：成功重命名 {changed} 份 PDF，PDF 内容未修改。")
-    return 0
+    return len(plans), changed
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        run_scan(args.folder, preview=args.preview)
+        return 0
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"\n已停止，未重命名任何文件：\n{exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

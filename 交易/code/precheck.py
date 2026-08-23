@@ -12,9 +12,6 @@ from collections import defaultdict
 from pathlib import Path
 
 
-脚本目录 = Path(__file__).resolve().parent
-默认检查目录 = 脚本目录 / "确认书文件"
-
 # 浏览器或系统复制文件时常见的结尾，例如“文件 (1).pdf”“文件_副本.pdf”。
 复制件后缀 = re.compile(
     r"(?:\s*[（(]\d+[）)]|[\s_-]*(?:副本|复制件|copy)(?:\s*\d+)?)$",
@@ -44,6 +41,22 @@ def 计算哈希(文件路径: Path) -> str:
         while 数据 := 文件.read(1024 * 1024):
             摘要.update(数据)
     return 摘要.hexdigest()
+
+
+def 收集PDF(检查目录: Path) -> list[Path]:
+    return sorted(
+        (
+            路径
+            for 路径 in 检查目录.rglob("*")
+            if 路径.is_file() and 路径.suffix.casefold() == ".pdf"
+        ),
+        key=lambda 路径: str(路径).casefold(),
+    )
+
+
+def 统计PDF数量(检查目录: Path) -> int:
+    """供主流程和 split.py 数量校验复用。"""
+    return len(收集PDF(检查目录))
 
 
 def 添加分组(分组: dict[str, list[Path]], 标题: str, 输出: list[str]) -> int:
@@ -80,10 +93,7 @@ def 添加异常文件(文件列表: list[Path], 输出: list[str]) -> int:
 
 
 def 检查PDF(检查目录: Path) -> tuple[str, int]:
-    PDF列表 = sorted(
-        (路径 for 路径 in 检查目录.rglob("*") if 路径.is_file() and 路径.suffix.casefold() == ".pdf"),
-        key=lambda 路径: str(路径).casefold(),
-    )
+    PDF列表 = 收集PDF(检查目录)
 
     同名分组: dict[str, list[Path]] = defaultdict(list)
     疑似复制件分组: dict[str, list[Path]] = defaultdict(list)
@@ -116,6 +126,11 @@ def 检查PDF(检查目录: Path) -> tuple[str, int]:
         f"PDF 总数：{len(PDF列表)}",
     ]
     发现组数 = 0
+    if not PDF列表:
+        输出.append("\n零、未找到 PDF：1 项")
+        输出.append("=" * 72)
+        输出.append("确认书目录中没有可处理的 PDF。")
+        发现组数 += 1
     发现组数 += 添加分组(同名分组, "一、文件名完全相同", 输出)
     发现组数 += 添加分组(疑似复制件分组, "二、带 (1)、副本、copy 等后缀的疑似复制件", 输出)
     发现组数 += 添加分组(同内容分组, "三、文件内容完全相同（SHA-256 一致）", 输出)
@@ -131,10 +146,8 @@ def main() -> int:
     )
     解析器.add_argument(
         "目录",
-        nargs="?",
         type=Path,
-        default=默认检查目录,
-        help=f"要检查的目录（默认：{默认检查目录}）",
+        help="要检查的确认书目录",
     )
     参数 = 解析器.parse_args()
     检查目录 = 参数.目录.expanduser()

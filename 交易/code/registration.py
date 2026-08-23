@@ -18,10 +18,6 @@ from pathlib import Path
 from typing import Iterator
 
 
-PDF_FOLDER_NAME = "确认书文件"
-TEMPLATE_NAME = "登记表模版.xls"
-OUTPUT_PREFIX = "登记表"
-
 START_ROW = 5
 DATA_END_ROW = 27
 TEMPLATE_ROW_COUNT = 29
@@ -317,8 +313,60 @@ def write_registration(
     return page_count
 
 
+def run_registration(
+    pdf_folder: Path,
+    template_path: Path,
+    output_path: Path,
+    stamp_date: date,
+    preview: bool = False,
+) -> tuple[int, int]:
+    """生成登记表，返回（PDF 数量，登记表页数）。"""
+    pdf_folder = pdf_folder.expanduser().resolve()
+    template_path = template_path.expanduser().resolve()
+    output_path = output_path.expanduser().resolve()
+
+    required_paths = [
+        (pdf_folder, "PDF 文件夹"),
+        (template_path, "登记表模板"),
+    ]
+    for path, description in required_paths:
+        if not path.exists():
+            raise RuntimeError(f"找不到{description}：{path}")
+
+    names = collect_names(pdf_folder)
+    if not names:
+        raise RuntimeError(f"未在 {pdf_folder} 及其子文件夹中找到 PDF。")
+
+    page_count = required_page_count(len(names))
+    for number, name in enumerate(names, start=1):
+        print(f"{number:>3}. {name}")
+
+    print(
+        f"\nPDF 数量：{len(names)}\n"
+        f"需要页数：{page_count}（每页最多 23 条）\n"
+        f"盖章日期：{stamp_date:%Y-%m-%d}\n"
+        f"输出文件：{output_path}"
+    )
+
+    if preview:
+        print("\n预览完成：未修改模板，也未生成登记表。")
+        return len(names), page_count
+
+    write_registration(
+        template_path,
+        output_path,
+        names,
+        stamp_date,
+    )
+    print(f"\n已完成：{output_path}")
+    return len(names), page_count
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("pdf_folder", type=Path, help="要读取的确认书目录")
+    parser.add_argument("--template", type=Path, required=True, help="登记表模板路径")
+    parser.add_argument("--output", type=Path, required=True, help="登记表输出路径")
     parser.add_argument(
         "--preview",
         action="store_true",
@@ -329,49 +377,18 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    base_folder = Path(__file__).resolve().parent
-    pdf_folder = base_folder / PDF_FOLDER_NAME
-    template_path = base_folder / TEMPLATE_NAME
-    today = date.today()
-    output_path = base_folder / f"{OUTPUT_PREFIX}{today:%Y%m%d}.xls"
-
-    required_paths = [
-        (pdf_folder, "PDF 文件夹"),
-        (template_path, "登记表模板"),
-    ]
-    for path, description in required_paths:
-        if not path.exists():
-            print(f"找不到{description}：{path}", file=sys.stderr)
-            return 1
-
-    names = collect_names(pdf_folder)
-    if not names:
-        print(f"未在 {pdf_folder} 及其子文件夹中找到 PDF。", file=sys.stderr)
-        return 1
-
-    page_count = required_page_count(len(names))
-    for number, name in enumerate(names, start=1):
-        print(f"{number:>3}. {name}")
-
-    print(
-        f"\nPDF 数量：{len(names)}\n"
-        f"需要页数：{page_count}（每页最多 23 条）\n"
-        f"盖章日期：{today:%Y-%m-%d}\n"
-        f"输出文件：{output_path.name}"
-    )
-
-    if args.preview:
-        print("\n预览完成：未修改模板，也未生成登记表。")
+    try:
+        run_registration(
+            args.pdf_folder,
+            args.template,
+            args.output,
+            date.today(),
+            preview=args.preview,
+        )
         return 0
-
-    write_registration(
-        template_path,
-        output_path,
-        names,
-        today,
-    )
-    print(f"\n已完成：{output_path}")
-    return 0
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
