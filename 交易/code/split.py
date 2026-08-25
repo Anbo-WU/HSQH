@@ -27,9 +27,21 @@ from datetime import date, datetime
 from pathlib import Path
 
 
+# Vision 偶尔会在编号内部插入句点、空格或中文标点，例如把 FWJY
+# 识别成 FW.JY。编号各段的长度仍然固定，因此可安全忽略这些分隔噪声。
+OCR_SEPARATOR = r"[\s._·•,，:：/\\\-‐‑‒–—−]*"
 TRANSACTION_PATTERN = re.compile(
-    r"(?<![0-9A-Z])([0-9OQILSZBGD|]{4})\s*[-‐‑‒–—−]?\s*"
-    r"(FWJY|JY)\s*[-‐‑‒–—−]?\s*([0-9OQILSZBGD|]{10})(?![0-9A-Z])",
+    r"(?<![0-9A-Z])([0-9OQILSZBGD|]{4})"
+    + OCR_SEPARATOR
+    + r"([A-Z]"
+    + OCR_SEPARATOR
+    + r"[A-Z](?:"
+    + OCR_SEPARATOR
+    + r"[A-Z]"
+    + OCR_SEPARATOR
+    + r"[A-Z])?)"
+    + OCR_SEPARATOR
+    + r"([0-9OQILSZBGD|]{10})(?![0-9A-Z])",
     flags=re.IGNORECASE,
 )
 
@@ -201,6 +213,14 @@ class StartMarker:
 
 
 @dataclass(frozen=True)
+class TitleMarker:
+    kind: str
+    page_count: int
+    title_text: str
+    line_index: int
+
+
+@dataclass(frozen=True)
 class SplitPlan:
     number: int
     start_page: int
@@ -213,6 +233,19 @@ class SplitPlan:
     @property
     def page_count(self) -> int:
         return self.end_page - self.start_page + 1
+
+
+@dataclass(frozen=True)
+class SplitIssue:
+    number: int | None
+    start_page: int
+    end_page: int
+    reason: str
+    title_text: str | None = None
+
+
+class PartialSplitError(RuntimeError):
+    """部分 PDF 已安全生成，但仍有页段需要人工处理。"""
 
 
 def normalize_text(text: str) -> str:
@@ -323,22 +356,43 @@ def ordered_lines(page: PageOCR) -> list[OCRLine]:
     return sorted(page.lines, key=lambda line: (-(line.y + line.height), line.x))
 
 
-def transaction_number(text: str) -> str | None:
+def normalize_trade_type(raw_type: str, expected_type: str | None = None) -> str | None:
+    trade_type = re.sub(r"[^A-Z]", "", raw_type.upper())
+    if trade_type in {"JY", "FWJY"}:
+        return trade_type
+    if (
+        expected_type in {"JY", "FWJY"}
+        and len(trade_type) == len(expected_type)
+        and sum(left != right for left, right in zip(trade_type, expected_type)) <= 1
+    ):
+        return expected_type
+    return None
+
+
+def transaction_number(
+    text: str,
+    expected_trade_type: str | None = None,
+) -> str | None:
     matches = {
         (match.group(1), match.group(2).upper(), match.group(3))
         for match in TRANSACTION_PATTERN.finditer(text)
     }
     if len(matches) != 1:
         return None
-    company_code, trade_type, serial = matches.pop()
+    company_code, raw_trade_type, serial = matches.pop()
     company_code = company_code.upper().translate(OCR_DIGIT_TRANSLATION)
+    trade_type = normalize_trade_type(raw_trade_type, expected_trade_type)
     serial = serial.upper().translate(OCR_DIGIT_TRANSLATION)
-    if not (company_code.isdigit() and serial.isdigit()):
+    if (
+        not company_code.isdigit()
+        or trade_type is None
+        or not serial.isdigit()
+    ):
         return None
     return f"【HFSY】{company_code}-{trade_type}-{serial}"
 
 
-def detect_start(page: PageOCR) -> StartMarker | None:
+def detect_title(page: PageOCR) -> TitleMarker | None:
     lines = ordered_lines(page)
     for index, line in enumerate(lines):
         if line.y < 0.55:
@@ -359,17 +413,31 @@ def detect_start(page: PageOCR) -> StartMarker | None:
         if line.height < 0.014:
             continue
 
-        # 交易编号必须紧跟在标题之后，并且位于标题下方。
-        nearby = [
-            candidate
-            for candidate in lines[index + 1 : index + 7]
-            if candidate.y < line.y and line.y - candidate.y <= 0.20
-        ]
-        number = transaction_number("\n".join(item.text for item in nearby))
-        if number is None:
-            continue
-        return StartMarker(kind, expected_pages, number, line.text)
+        return TitleMarker(kind, expected_pages, line.text, index)
     return None
+
+
+def detect_start(page: PageOCR) -> StartMarker | None:
+    lines = ordered_lines(page)
+    title = detect_title(page)
+    if title is None:
+        return None
+    line = lines[title.line_index]
+
+    # 交易编号必须紧跟在标题之后，并且位于标题下方。
+    nearby = [
+        candidate
+        for candidate in lines[title.line_index + 1 : title.line_index + 7]
+        if candidate.y < line.y and line.y - candidate.y <= 0.20
+    ]
+    expected_trade_type = "FWJY" if title.kind == "场外商品远期交易确认书" else "JY"
+    number = transaction_number(
+        "\n".join(item.text for item in nearby),
+        expected_trade_type,
+    )
+    if number is None:
+        return None
+    return StartMarker(title.kind, title.page_count, number, title.title_text)
 
 
 def detect_footer(page: PageOCR) -> bool:
@@ -385,63 +453,148 @@ def detect_footer(page: PageOCR) -> bool:
     return "盖章" in normalized
 
 
-def build_plans(pages: list[PageOCR], expected_count: int) -> list[SplitPlan]:
+def analyze_split_plans(
+    pages: list[PageOCR],
+    expected_count: int,
+) -> tuple[list[SplitPlan], list[SplitIssue]]:
     if expected_count < 1:
         raise RuntimeError("确认书文件目录中没有 PDF，无法取得预期确认书数量。")
     if not pages:
         raise RuntimeError("扫描 PDF 没有页面。")
 
+    titles = {
+        page.page: marker
+        for page in pages
+        if (marker := detect_title(page)) is not None
+    }
     starts = {
         page.page: marker
         for page in pages
         if (marker := detect_start(page)) is not None
     }
     footers = {page.page for page in pages if detect_footer(page)}
-    if 1 not in starts:
-        raise RuntimeError("第 1 页未同时识别到确认书大标题和其下方交易编号。")
 
     plans: list[SplitPlan] = []
+    issues: list[SplitIssue] = []
     current_page = 1
+    document_number = 1
     while current_page <= len(pages):
+        title = titles.get(current_page)
+        if title is None:
+            next_title = min(
+                (page_number for page_number in titles if page_number > current_page),
+                default=len(pages) + 1,
+            )
+            end_page = next_title - 1
+            issues.append(
+                SplitIssue(
+                    number=None,
+                    start_page=current_page,
+                    end_page=end_page,
+                    reason="未识别到确认书大标题，无法可靠确定该页段包含几份文件",
+                )
+            )
+            current_page = next_title
+            continue
+
+        end_page = current_page + title.page_count - 1
+        if end_page > len(pages):
+            issues.append(
+                SplitIssue(
+                    number=document_number,
+                    start_page=current_page,
+                    end_page=len(pages),
+                    reason=(
+                        f"识别为{title.kind}，应有 {title.page_count} 页，"
+                        "但扫描 PDF 已结束"
+                    ),
+                    title_text=title.title_text,
+                )
+            )
+            document_number += 1
+            break
+
+        unexpected_titles = [
+            page for page in titles if current_page < page <= end_page
+        ]
+        if unexpected_titles:
+            next_title = min(unexpected_titles)
+            issues.append(
+                SplitIssue(
+                    number=document_number,
+                    start_page=current_page,
+                    end_page=next_title - 1,
+                    reason=(
+                        f"识别为{title.kind}，固定应有 {title.page_count} 页，"
+                        f"但第 {next_title} 页又出现新标题"
+                    ),
+                    title_text=title.title_text,
+                )
+            )
+            document_number += 1
+            current_page = next_title
+            continue
+
         marker = starts.get(current_page)
         if marker is None:
-            raise RuntimeError(f"第 {current_page} 页未识别为确认书首页。")
-
-        end_page = current_page + marker.page_count - 1
-        if end_page > len(pages):
-            raise RuntimeError(
-                f"第 {current_page} 页识别为{marker.kind}，应有 {marker.page_count} 页，"
-                "但扫描 PDF 已结束。"
+            issues.append(
+                SplitIssue(
+                    number=document_number,
+                    start_page=current_page,
+                    end_page=end_page,
+                    reason="大标题已识别，但其下方交易编号无法通过格式校验",
+                    title_text=title.title_text,
+                )
             )
-
-        unexpected_starts = [
-            page for page in starts if current_page < page <= end_page
-        ]
-        if unexpected_starts:
-            raise RuntimeError(
-                f"第 {current_page} 页开始的确认书固定应有 {marker.page_count} 页，"
-                f"但第 {min(unexpected_starts)} 页又识别到新标题。"
+        else:
+            plans.append(
+                SplitPlan(
+                    number=document_number,
+                    start_page=current_page,
+                    end_page=end_page,
+                    kind=marker.kind,
+                    transaction_number=marker.transaction_number,
+                    filename=f"{document_number}.pdf",
+                    footer_confirmed=end_page in footers,
+                )
             )
-
-        number = len(plans) + 1
-        plans.append(
-            SplitPlan(
-                number=number,
-                start_page=current_page,
-                end_page=end_page,
-                kind=marker.kind,
-                transaction_number=marker.transaction_number,
-                filename=f"{number}.pdf",
-                footer_confirmed=end_page in footers,
-            )
-        )
+        document_number += 1
         current_page = end_page + 1
 
-    if len(plans) != expected_count:
-        raise RuntimeError(
-            f"拆分识别出 {len(plans)} 份确认书，但确认书文件目录中有 "
-            f"{expected_count} 份；数量不一致。"
+    identified_documents = document_number - 1
+    if identified_documents != expected_count:
+        issues.append(
+            SplitIssue(
+                number=None,
+                start_page=0,
+                end_page=0,
+                reason=(
+                    f"根据页面边界识别出 {identified_documents} 份，"
+                    f"确认书文件目录中有 {expected_count} 份；数量不一致"
+                ),
+            )
         )
+    return plans, issues
+
+
+def format_issue(issue: SplitIssue) -> str:
+    if issue.start_page > 0:
+        page_range = (
+            f"第 {issue.start_page} 页"
+            if issue.start_page == issue.end_page
+            else f"第 {issue.start_page}-{issue.end_page} 页"
+        )
+    else:
+        page_range = "全局校验"
+    number = f"第 {issue.number} 份，" if issue.number is not None else ""
+    return f"{number}{page_range}：{issue.reason}"
+
+
+def build_plans(pages: list[PageOCR], expected_count: int) -> list[SplitPlan]:
+    """严格模式兼容接口：存在任何异常时仍抛出错误。"""
+    plans, issues = analyze_split_plans(pages, expected_count)
+    if issues:
+        raise RuntimeError("拆分计划存在异常：\n  " + "\n  ".join(map(format_issue, issues)))
     return plans
 
 
@@ -453,10 +606,17 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def print_plans(source: Path, plans: list[SplitPlan], output_folder: Path) -> None:
+def print_plans(
+    source: Path,
+    plans: list[SplitPlan],
+    issues: list[SplitIssue],
+    output_folder: Path,
+    total_pages: int,
+) -> None:
     print(f"扫描源文件：{source}")
-    print(f"扫描总页数：{plans[-1].end_page if plans else 0}")
-    print(f"确认书数量：{len(plans)}")
+    print(f"扫描总页数：{total_pages}")
+    print(f"可自动拆分数量：{len(plans)}")
+    print(f"异常数量：{len(issues)}")
     print(f"拆分输出目录：{output_folder}")
     print("\n拆分计划：")
     for plan in plans:
@@ -467,6 +627,15 @@ def print_plans(source: Path, plans: list[SplitPlan], output_folder: Path) -> No
             f"-> {plan.filename}"
         )
         print(f"       {plan.transaction_number}")
+    if not plans:
+        print("  无可安全自动拆分的文件。")
+
+    if issues:
+        print("\n需要人工处理的异常：")
+        for issue in issues:
+            print(f"  [跳过] {format_issue(issue)}")
+            if issue.title_text:
+                print(f"         OCR 标题：{issue.title_text}")
 
 
 def reusable_output(
@@ -474,9 +643,9 @@ def reusable_output(
     source: Path,
     source_hash: str,
     expected_count: int,
-) -> bool:
+) -> dict[str, object] | None:
     if not output_folder.exists():
-        return False
+        return None
     if not output_folder.is_dir():
         raise RuntimeError(f"拆分输出路径已存在且不是文件夹：{output_folder}")
     manifest_path = output_folder / "拆分记录.json"
@@ -492,26 +661,31 @@ def reusable_output(
         path.is_file() and path.suffix.casefold() == ".pdf"
         for path in output_folder.iterdir()
     )
+    documents = manifest.get("documents", [])
+    issues = manifest.get("issues", [])
     matches = (
         manifest.get("source_name") == source.name
         and manifest.get("source_sha256") == source_hash
         and manifest.get("expected_count") == expected_count
-        and len(manifest.get("documents", [])) == expected_count
-        and pdf_count == expected_count
+        and isinstance(documents, list)
+        and isinstance(issues, list)
+        and pdf_count == len(documents)
     )
     if not matches:
         raise RuntimeError(
             f"已有拆分目录与本次源文件或预期数量不一致，未覆盖：{output_folder}"
         )
-    return True
+    return manifest
 
 
 def write_split_pdfs(
     source: Path,
     output_folder: Path,
     plans: list[SplitPlan],
+    issues: list[SplitIssue],
     source_hash: str,
     expected_count: int,
+    total_pages: int,
 ) -> None:
     output_folder.parent.mkdir(parents=True, exist_ok=True)
     temp_path = Path(
@@ -545,17 +719,25 @@ def write_split_pdfs(
                 raise RuntimeError(result.stderr.strip() or "PDF 拆分失败。")
 
         generated = sorted(temp_path.glob("*.pdf"), key=lambda path: path.name)
-        if len(generated) != expected_count:
+        if len(generated) != len(plans):
             raise RuntimeError(
-                f"实际生成 {len(generated)} 个 PDF，预期 {expected_count} 个。"
+                f"实际生成 {len(generated)} 个 PDF，拆分计划为 {len(plans)} 个。"
             )
+        status = (
+            "complete"
+            if not issues and len(plans) == expected_count
+            else "partial"
+        )
         manifest = {
             "source_name": source.name,
             "source_size": source.stat().st_size,
             "source_sha256": source_hash,
             "expected_count": expected_count,
-            "total_pages": plans[-1].end_page,
+            "generated_count": len(plans),
+            "status": status,
+            "total_pages": total_pages,
             "documents": [asdict(plan) for plan in plans],
+            "issues": [asdict(issue) for issue in issues],
         }
         (temp_path / "拆分记录.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
@@ -587,9 +769,26 @@ def run_split(
     source = source_pdf_for_date(scan_folder, effective_scan_date)
     source_hash = file_sha256(source)
 
-    if reusable_output(output_folder, source, source_hash, expected_count):
-        print(f"已有拆分结果与本次扫描件一致，直接复用：{output_folder}")
-        return expected_count, 0
+    existing_manifest = reusable_output(
+        output_folder,
+        source,
+        source_hash,
+        expected_count,
+    )
+    if existing_manifest is not None:
+        documents = existing_manifest.get("documents", [])
+        issues = existing_manifest.get("issues", [])
+        status = existing_manifest.get(
+            "status",
+            "complete" if len(documents) == expected_count else "partial",
+        )
+        if status == "complete" and len(documents) == expected_count:
+            print(f"已有拆分结果与本次扫描件一致，直接复用：{output_folder}")
+            return expected_count, 0
+        raise PartialSplitError(
+            f"已有部分拆分结果可供 continue 使用：{output_folder}\n"
+            f"已生成 {len(documents)} 个 PDF，记录 {len(issues)} 项异常。"
+        )
 
     print(f"正在 OCR 识别 {source.name} 的全部页面……")
     pages = recognize_pages(source)
@@ -598,13 +797,36 @@ def run_split(
         footer_pages = [page.page for page in pages if detect_footer(page)]
         print(f"识别到确认书首页：{start_pages}")
         print(f"识别到右下角盖章结束语：{footer_pages}")
-    plans = build_plans(pages, expected_count)
-    print_plans(source, plans, output_folder)
+    plans, issues = analyze_split_plans(pages, expected_count)
+    print_plans(source, plans, issues, output_folder, len(pages))
     if preview:
+        if issues:
+            raise PartialSplitError(
+                f"预览发现 {len(issues)} 项异常；预览模式未生成拆分 PDF。"
+            )
         print("\n预览完成：未生成拆分 PDF。")
         return len(plans), len(pages)
 
-    write_split_pdfs(source, output_folder, plans, source_hash, expected_count)
+    if not plans:
+        raise RuntimeError("没有可安全自动拆分的确认书，未生成拆分目录。")
+
+    write_split_pdfs(
+        source,
+        output_folder,
+        plans,
+        issues,
+        source_hash,
+        expected_count,
+        len(pages),
+    )
+    if issues:
+        raise PartialSplitError(
+            f"部分拆分完成：已生成 {len(plans)} 个正常 PDF，"
+            f"跳过 {len(issues)} 项异常。\n"
+            f"部分结果保存在：{output_folder}\n"
+            "请选择 continue 继续执行 scan.py，或选择 resplit 清空后重试。"
+        )
+
     print(f"\n拆分完成：已生成 {len(plans)} 个 PDF。")
     return len(plans), len(pages)
 
@@ -645,6 +867,9 @@ def main() -> int:
             scan_date=args.scan_date,
         )
         return 0
+    except PartialSplitError as exc:
+        print(f"\n{exc}", file=sys.stderr)
+        return 3
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"\n拆分已停止，未生成新的拆分目录：\n{exc}", file=sys.stderr)
         return 1

@@ -18,15 +18,27 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
 
-# 不依赖 OCR 必须准确识别书名号和 HFSY，只严格提取核心结构。
+# 不依赖 OCR 必须准确识别书名号和 HFSY。Vision 偶尔会把 FWJY
+# 识别成 FW.JY，因此允许编号各固定字段之间混入少量分隔标点。
+OCR_SEPARATOR = r"[\s._·•,，:：/\\\-‐‑‒–—−]*"
 TRANSACTION_PATTERN = re.compile(
-    r"(?<![0-9A-Z])([0-9OQILSZBGD|]{4})\s*[-‐‑‒–—−]?\s*"
-    r"(FWJY|JY)\s*[-‐‑‒–—−]?\s*([0-9OQILSZBGD|]{10})(?![0-9A-Z])",
+    r"(?<![0-9A-Z])([0-9OQILSZBGD|]{4})"
+    + OCR_SEPARATOR
+    + r"([A-Z]"
+    + OCR_SEPARATOR
+    + r"[A-Z](?:"
+    + OCR_SEPARATOR
+    + r"[A-Z]"
+    + OCR_SEPARATOR
+    + r"[A-Z])?)"
+    + OCR_SEPARATOR
+    + r"([0-9OQILSZBGD|]{10})(?![0-9A-Z])",
     flags=re.IGNORECASE,
 )
 
@@ -201,6 +213,33 @@ def recognize_all(pdfs: list[Path]) -> dict[Path, str]:
     return recognized
 
 
+def normalize_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    return "".join(character for character in normalized if character.isalnum())
+
+
+def expected_trade_type(text: str) -> str | None:
+    normalized = normalize_text(text)
+    if "远期交易确认书" in normalized:
+        return "FWJY"
+    if "期权交易确认书" in normalized:
+        return "JY"
+    return None
+
+
+def normalize_trade_type(raw_type: str, expected_type: str | None) -> str | None:
+    trade_type = re.sub(r"[^A-Z]", "", raw_type.upper())
+    if trade_type in {"JY", "FWJY"}:
+        return trade_type
+    if (
+        expected_type in {"JY", "FWJY"}
+        and len(trade_type) == len(expected_type)
+        and sum(left != right for left, right in zip(trade_type, expected_type)) <= 1
+    ):
+        return expected_type
+    return None
+
+
 def extract_transaction_number(text: str, pdf_name: str) -> str:
     matches = {
         (match.group(1), match.group(2).upper(), match.group(3))
@@ -210,11 +249,16 @@ def extract_transaction_number(text: str, pdf_name: str) -> str:
         detail = "未识别到" if not matches else "识别到多个候选编号"
         raise ValueError(f"{pdf_name}: {detail}")
 
-    company_code, trade_type, serial = matches.pop()
+    company_code, raw_trade_type, serial = matches.pop()
     company_code = company_code.upper().translate(OCR_DIGIT_TRANSLATION)
+    trade_type = normalize_trade_type(raw_trade_type, expected_trade_type(text))
     serial = serial.upper().translate(OCR_DIGIT_TRANSLATION)
-    if not (company_code.isdigit() and serial.isdigit()):
-        raise ValueError(f"{pdf_name}: 交易编号数字字段包含无法纠正的字符")
+    if (
+        not company_code.isdigit()
+        or trade_type is None
+        or not serial.isdigit()
+    ):
+        raise ValueError(f"{pdf_name}: 交易编号包含无法安全纠正的字符")
     return f"【HFSY】{company_code}-{trade_type}-{serial}"
 
 

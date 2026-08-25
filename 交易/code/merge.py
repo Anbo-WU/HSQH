@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """递归扫描指定确认书文件夹，转换 Word 文档并按自然顺序合并全部 PDF。
 
-Word 转 PDF 使用 LibreOffice 的无界面模式；macOS 上的 PDF 合并优先使用
+Word 转 PDF 使用本机 WPS 的原生排版引擎；macOS 上的 PDF 合并优先使用
 系统 PDFKit，因此通常不需要额外安装 Python 包。
 """
 
@@ -14,11 +14,168 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import uuid
+import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Iterable
 
 
 WORD_SUFFIXES = {".doc", ".docx"}
+WPS_APP = Path("/Applications/wpsoffice.app")
+
+
+WPS_EXPORT_SCRIPT = r'''
+on run argv
+    set sourcePath to item 1 of argv
+    set sourceName to item 2 of argv
+
+    tell application id "com.kingsoft.wpsoffice.mac"
+        activate
+        open POSIX file sourcePath
+    end tell
+
+    tell application "System Events"
+        tell process "wpsoffice"
+            repeat 240 times
+                if exists window sourceName then exit repeat
+                delay 0.25
+            end repeat
+            if not (exists window sourceName) then
+                error "WPS 未在 60 秒内打开指定 Word：" & sourceName
+            end if
+
+            set frontmost to true
+            tell menu 1 of menu bar item 3 of menu bar 1
+                if exists menu item "Export to PDF..." then
+                    click menu item "Export to PDF..."
+                else if exists menu item "Export to PDF…" then
+                    click menu item "Export to PDF…"
+                else if exists menu item "输出为 PDF..." then
+                    click menu item "输出为 PDF..."
+                else if exists menu item "输出为PDF..." then
+                    click menu item "输出为PDF..."
+                else if exists menu item "导出为 PDF..." then
+                    click menu item "导出为 PDF..."
+                else if exists menu item "导出为PDF..." then
+                    click menu item "导出为PDF..."
+                else
+                    error "找不到 WPS 的导出 PDF 菜单"
+                end if
+            end tell
+
+            set exportWindowName to ""
+            repeat 240 times
+                if exists window "Export to PDF" then
+                    set exportWindowName to "Export to PDF"
+                    exit repeat
+                else if exists window "输出为 PDF" then
+                    set exportWindowName to "输出为 PDF"
+                    exit repeat
+                else if exists window "输出为PDF" then
+                    set exportWindowName to "输出为PDF"
+                    exit repeat
+                else if exists window "导出为 PDF" then
+                    set exportWindowName to "导出为 PDF"
+                    exit repeat
+                else if exists window "导出为PDF" then
+                    set exportWindowName to "导出为PDF"
+                    exit repeat
+                end if
+                delay 0.25
+            end repeat
+            if exportWindowName is "" then
+                error "WPS 未在 60 秒内打开导出 PDF 窗口"
+            end if
+
+            tell group 1 of window exportWindowName
+                repeat 240 times
+                    if (count of pop up buttons) is greater than or equal to 2 then
+                        if (exists button "Export") or (exists button "导出") then
+                            exit repeat
+                        end if
+                    end if
+                    delay 0.25
+                end repeat
+                if (count of pop up buttons) is less than 2 then
+                    error "WPS 导出窗口尚未加载完成"
+                end if
+
+                set outputPopup to pop up button 2
+                click outputPopup
+                delay 0.5
+                -- 使用 WPS 已获写入权限的自定义目录。临时 Word 使用随机文件名，
+                -- 因此不会覆盖该目录中的任何既有 PDF。
+                key code 115
+                key code 125
+                key code 36
+                delay 0.5
+
+                set outputPopup to pop up button 2
+                set outputChoice to name of outputPopup
+                if outputChoice is not "Custom Folder" and outputChoice is not "自定义文件夹" then
+                    error "无法把 WPS 输出位置切换到自定义文件夹，当前为：" & outputChoice
+                end if
+
+                set outputFolder to ""
+                repeat with labelItem in every static text
+                    try
+                        set labelText to value of labelItem as text
+                        if labelText starts with "/" then set outputFolder to labelText
+                    end try
+                end repeat
+                if outputFolder is "" then
+                    error "无法读取 WPS 自定义输出目录"
+                end if
+
+                if exists button "Export" then
+                    click button "Export"
+                else if exists button "导出" then
+                    click button "导出"
+                else
+                    error "找不到 WPS 导出按钮"
+                end if
+            end tell
+            return "WPS_OUTPUT_FOLDER=" & outputFolder
+        end tell
+    end tell
+end run
+'''
+
+
+WPS_CLEANUP_SCRIPT = r'''
+on run argv
+    set sourceName to item 1 of argv
+    tell application "System Events"
+        if not (exists process "wpsoffice") then return
+        tell process "wpsoffice"
+            set frontmost to true
+            if exists window "Task Completed" then
+                tell window "Task Completed"
+                    set taskCloseButtons to every button whose description is "close button"
+                    if (count of taskCloseButtons) > 0 then click item 1 of taskCloseButtons
+                end tell
+                delay 0.25
+            end if
+            repeat with dialogName in {"Export to PDF", "输出为 PDF", "输出为PDF", "导出为 PDF", "导出为PDF"}
+                if exists window dialogName then
+                    tell window dialogName
+                        set closeButtons to every button whose description is "close button"
+                        if (count of closeButtons) > 0 then click item 1 of closeButtons
+                    end tell
+                    exit repeat
+                end if
+            end repeat
+            delay 0.5
+            if exists window sourceName then
+                set frontmost to true
+                keystroke "w" using command down
+            end if
+        end tell
+    end tell
+end run
+'''
 
 
 SWIFT_PDF_MERGER = r'''
@@ -144,14 +301,8 @@ def print_scan_report(files: list[Path], root: Path, output: Path) -> tuple[list
     return pdfs, word_files
 
 
-def find_libreoffice() -> Path | None:
-    for command in ("libreoffice", "soffice"):
-        found = shutil.which(command)
-        if found:
-            return Path(found)
-
-    mac_app_binary = Path("/Applications/LibreOffice.app/Contents/MacOS/soffice")
-    return mac_app_binary if mac_app_binary.is_file() else None
+def find_wps_office() -> Path | None:
+    return WPS_APP if WPS_APP.is_dir() else None
 
 
 def check_word_targets(word_files: list[Path]) -> None:
@@ -168,46 +319,163 @@ def check_word_targets(word_files: list[Path]) -> None:
         targets[key] = source
 
 
+def declared_docx_page_count(source: Path) -> int | None:
+    """读取 Word 保存时记录的页数；旧版 .doc 没有对应的 OOXML 元数据。"""
+    if source.suffix.casefold() != ".docx":
+        return None
+    try:
+        with zipfile.ZipFile(source) as document:
+            properties = ET.fromstring(document.read("docProps/app.xml"))
+    except (KeyError, OSError, ET.ParseError, zipfile.BadZipFile) as exc:
+        raise RuntimeError(f"无法读取 DOCX 页数信息：{source.name}") from exc
+
+    pages = properties.find(
+        "{http://schemas.openxmlformats.org/officeDocument/2006/extended-properties}Pages"
+    )
+    if pages is None or not (pages.text or "").isdigit():
+        return None
+    page_count = int(pages.text or "0")
+    return page_count if page_count > 0 else None
+
+
+def pdf_page_count(pdf: Path) -> int | None:
+    """读取常规 PDF 的页面对象数；对象流 PDF 无法可靠读取时返回 None。"""
+    try:
+        data = pdf.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"无法读取转换后的 PDF：{pdf}") from exc
+    count = len(re.findall(rb"/Type\s*/Page\b", data))
+    return count if count > 0 else None
+
+
+def validate_word_pdf(source: Path, target: Path) -> int | None:
+    if not target.is_file() or target.stat().st_size < 5:
+        raise RuntimeError("WPS 未生成有效的 PDF 文件")
+    with target.open("rb") as converted_file:
+        if converted_file.read(5) != b"%PDF-":
+            raise RuntimeError("WPS 转换结果不是有效的 PDF 文件")
+
+    expected_pages = declared_docx_page_count(source)
+    actual_pages = pdf_page_count(target)
+    if (
+        expected_pages is not None
+        and actual_pages is not None
+        and expected_pages != actual_pages
+    ):
+        raise RuntimeError(
+            f"转换页数异常：Word 记录为 {expected_pages} 页，"
+            f"PDF 实际为 {actual_pages} 页"
+        )
+    return actual_pages
+
+
+def wait_for_pdf(target: Path, timeout: float = 180.0) -> None:
+    deadline = time.monotonic() + timeout
+    previous_size = -1
+    stable_checks = 0
+    while time.monotonic() < deadline:
+        if target.is_file():
+            size = target.stat().st_size
+            if size >= 5 and size == previous_size:
+                stable_checks += 1
+                if stable_checks >= 3:
+                    return
+            else:
+                stable_checks = 0
+            previous_size = size
+        time.sleep(0.5)
+    raise RuntimeError(f"等待 WPS 输出超时：{target}")
+
+
+def run_wps_script(script_text: str, *arguments: str) -> subprocess.CompletedProcess[str]:
+    osascript = shutil.which("osascript")
+    if osascript is None:
+        raise RuntimeError("找不到 macOS osascript，无法调用 WPS 导出 PDF。")
+    with tempfile.TemporaryDirectory(prefix=".wps_automation_") as temp_name:
+        script_path = Path(temp_name) / "wps_export.applescript"
+        script_path.write_text(script_text, encoding="utf-8")
+        return subprocess.run(
+            [osascript, str(script_path), *arguments],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=190,
+        )
+
+
+def cleanup_wps_window(source: Path) -> None:
+    try:
+        run_wps_script(WPS_CLEANUP_SCRIPT, source.name)
+    except (OSError, subprocess.SubprocessError):
+        # 转换结果已经单独校验；清理 WPS 窗口失败不应破坏正确 PDF。
+        pass
+
+
+def wps_output_folder(stdout: str) -> Path:
+    prefix = "WPS_OUTPUT_FOLDER="
+    for line in reversed(stdout.splitlines()):
+        if line.startswith(prefix):
+            folder = Path(line.removeprefix(prefix)).expanduser()
+            if folder.is_dir():
+                return folder
+            raise RuntimeError(f"WPS 输出目录不存在：{folder}")
+    raise RuntimeError("WPS 未返回实际输出目录。")
+
+
 def convert_one_word(
     source: Path,
     target: Path,
-    libreoffice: Path,
+    wps_office: Path,
     overwrite: bool,
 ) -> str:
     if target.exists() and not overwrite:
-        return "同名 PDF 已存在，直接使用"
+        pages = validate_word_pdf(source, target)
+        detail = f"，{pages} 页" if pages is not None else ""
+        return f"同名 PDF 已存在且校验通过，直接使用{detail}"
 
+    if not wps_office.is_dir():
+        raise RuntimeError(f"找不到 WPS Office：{wps_office}")
+    if not same_path(target, source.with_suffix(".pdf")):
+        raise RuntimeError("WPS 自动导出仅支持生成 Word 所在目录中的同名 PDF。")
+
+    converted: Path | None = None
+    staged_target = target.with_name(f".{target.name}.wps-{uuid.uuid4().hex}.tmp")
     with tempfile.TemporaryDirectory(
-        prefix=".word_to_pdf_", dir=target.parent
+        prefix=".wps_source_", dir=target.parent
     ) as temp_name:
-        temp_folder = Path(temp_name)
-        profile_folder = temp_folder / "libreoffice_profile"
-        output_folder = temp_folder / "output"
-        output_folder.mkdir()
+        temp_source = Path(temp_name) / f"wps-{uuid.uuid4().hex}{source.suffix.casefold()}"
+        shutil.copy2(source, temp_source)
+        try:
+            result = run_wps_script(
+                WPS_EXPORT_SCRIPT,
+                str(temp_source.resolve()),
+                temp_source.name,
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout).strip()
+                if "辅助功能" in detail or "not authorized" in detail.casefold():
+                    detail += (
+                        "\n请在“系统设置 → 隐私与安全性 → 辅助功能”中允许当前终端控制 WPS。"
+                    )
+                raise RuntimeError(detail or "WPS 自动导出失败")
 
-        command = [
-            str(libreoffice),
-            "--headless",
-            f"-env:UserInstallation={profile_folder.resolve().as_uri()}",
-            "--convert-to",
-            "pdf:writer_pdf_Export",
-            "--outdir",
-            str(output_folder),
-            str(source.resolve()),
-        ]
-        result = subprocess.run(command, capture_output=True, text=True, check=False)
-        converted = output_folder / f"{source.stem}.pdf"
-        if result.returncode != 0 or not converted.is_file():
-            detail = (result.stderr or result.stdout).strip() or "LibreOffice 未生成 PDF"
-            raise RuntimeError(detail)
-        with converted.open("rb") as converted_file:
-            signature = converted_file.read(5)
-        if converted.stat().st_size < 5 or signature != b"%PDF-":
-            raise RuntimeError("转换结果不是有效的 PDF 文件")
+            output_folder = wps_output_folder(result.stdout)
+            converted = output_folder / temp_source.with_suffix(".pdf").name
+            wait_for_pdf(converted)
+            pages = validate_word_pdf(source, converted)
 
-        # 转换先在临时目录完成，成功后才替换目标，避免留下半成品。
-        os.replace(converted, target)
-    return "转换完成"
+            shutil.copy2(converted, staged_target)
+            validate_word_pdf(source, staged_target)
+            os.replace(staged_target, target)
+        finally:
+            cleanup_wps_window(temp_source)
+            if staged_target.exists():
+                staged_target.unlink()
+            if converted is not None and converted.exists():
+                converted.unlink()
+
+    detail = f"，{pages} 页" if pages is not None else ""
+    return f"WPS 转换完成{detail}"
 
 
 def convert_word_files(
@@ -223,13 +491,12 @@ def convert_word_files(
     needs_conversion = [
         source for source in word_files if overwrite or not source.with_suffix(".pdf").exists()
     ]
-    libreoffice = find_libreoffice() if needs_conversion else None
-    if needs_conversion and libreoffice is None:
+    wps_office = find_wps_office() if needs_conversion else None
+    if needs_conversion and wps_office is None:
         raise RuntimeError(
-            "发现需要转换的 Word 文件，但找不到 LibreOffice。\n"
-            "请先安装 LibreOffice（macOS 可运行：brew install --cask libreoffice），然后重试。\n"
-            "已安装的 WPS Mac 版没有官方稳定的批量转换命令行接口，"
-            "因此脚本不使用容易误操作的界面自动点击。"
+            "发现需要转换的 Word 文件，但找不到 WPS Office：\n"
+            f"  {WPS_APP}\n"
+            "为保证字体、行距和分页与原 Word 一致，本程序不会回退到 LibreOffice。"
         )
 
     print("\n开始处理 Word 文件：")
@@ -237,8 +504,8 @@ def convert_word_files(
     for source in word_files:
         target = source.with_suffix(".pdf")
         try:
-            assert libreoffice is not None or target.exists()
-            status = convert_one_word(source, target, libreoffice, overwrite)  # type: ignore[arg-type]
+            assert wps_office is not None or target.exists()
+            status = convert_one_word(source, target, wps_office or WPS_APP, overwrite)
             print(f"  [成功] {source.relative_to(root)} -> {target.name}（{status}）")
         except Exception as exc:
             failures.append(f"{source.relative_to(root)}：{exc}")

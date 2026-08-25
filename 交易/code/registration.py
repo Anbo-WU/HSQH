@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""递归读取“确认书文件”中的 PDF，从登记表模板生成当日登记表。
+"""递归读取“确认书文件”中的 PDF 和待转换 Word，生成当日登记表。
 
 每个模板页可填 23 条（第 5–27 行）；数量超出时，会在同一张
 工作表中向下复制足够的整页模板，并在页之间设置手动分页。
@@ -33,11 +33,18 @@ REVIEW_COLUMN_INDEX = 5
 
 CHECKED_TEXT = "是☑   否☐"
 DATE_NUMBER_FORMAT = "yyyy-mm-dd"
+WORD_SUFFIXES = {".doc", ".docx"}
 
 # 兼容实际文件名中的下划线、空格和连字符。
 REMOVE_PATTERN = re.compile(
     r"[\s_-]*商品交易确认书[\s_-]*【HFSY】[\s_-]*",
     flags=re.IGNORECASE,
+)
+
+# 与 precheck.py 的 PDF 标准命名规则保持一致，但这里只校验文件主体，
+# 因而同一规则也可用于尚未转换为 PDF 的 .doc 和 .docx。
+STANDARD_CONFIRMATION_STEM = re.compile(
+    r"^.+_商品交易确认书_【HFSY】\d{4}-(?:JY|FWJY)-\d{10}$"
 )
 
 
@@ -47,24 +54,76 @@ def natural_key(path: Path) -> list[tuple[int, object]]:
     return [(0, int(part)) if part.isdigit() else (1, part) for part in parts]
 
 
-def iter_pdfs(folder: Path) -> Iterator[Path]:
-    """先读当前层 PDF，再按名称自然排序递归所有子文件夹。"""
+def iter_confirmation_candidates(folder: Path) -> Iterator[Path]:
+    """先读当前层 PDF/Word，再按名称自然排序递归所有子文件夹。"""
     paths = sorted(folder.iterdir(), key=natural_key)
     for path in paths:
-        if path.is_file() and path.suffix.casefold() == ".pdf":
+        if path.is_file() and path.suffix.casefold() in ({".pdf"} | WORD_SUFFIXES):
             yield path
     for path in paths:
         if path.is_dir():
-            yield from iter_pdfs(path)
+            yield from iter_confirmation_candidates(path)
+
+
+def iter_pdfs(folder: Path) -> Iterator[Path]:
+    """兼容原有独立调用：只返回 PDF。"""
+    for path in iter_confirmation_candidates(folder):
+        if path.suffix.casefold() == ".pdf":
+            yield path
+
+
+def clean_confirmation_name(path: Path) -> str:
+    """去掉扩展名和指定文字及其相邻分隔符。"""
+    return REMOVE_PATTERN.sub("", path.stem).strip()
 
 
 def clean_pdf_name(pdf_path: Path) -> str:
-    """去掉 .pdf 扩展名和指定文字及其相邻分隔符。"""
-    return REMOVE_PATTERN.sub("", pdf_path.stem).strip()
+    """兼容原有独立调用。"""
+    return clean_confirmation_name(pdf_path)
+
+
+def collect_registration_files(
+    folder: Path,
+) -> tuple[list[Path], list[Path], list[Path], list[Path]]:
+    """返回（登记文件、纳入登记的 Word、异常 Word、已有同名 PDF 的 Word）。"""
+    candidates = list(iter_confirmation_candidates(folder))
+    pdf_stems = {
+        os.path.normcase(str(path.with_suffix("").resolve()))
+        for path in candidates
+        if path.suffix.casefold() == ".pdf"
+    }
+
+    registration_files: list[Path] = []
+    included_words: list[Path] = []
+    invalid_words: list[Path] = []
+    shadowed_words: list[Path] = []
+
+    for path in candidates:
+        suffix = path.suffix.casefold()
+        if suffix == ".pdf":
+            registration_files.append(path)
+            continue
+
+        if STANDARD_CONFIRMATION_STEM.fullmatch(path.stem) is None:
+            invalid_words.append(path)
+            continue
+
+        stem_key = os.path.normcase(str(path.with_suffix("").resolve()))
+        if stem_key in pdf_stems:
+            # merge.py 会复用同名 PDF；登记时只保留 PDF，避免同一确认书写两遍。
+            shadowed_words.append(path)
+            continue
+
+        registration_files.append(path)
+        included_words.append(path)
+
+    return registration_files, included_words, invalid_words, shadowed_words
 
 
 def collect_names(folder: Path) -> list[str]:
-    return [clean_pdf_name(path) for path in iter_pdfs(folder)]
+    """收集实际会写入登记表的名称，保留供独立调用者使用。"""
+    registration_files, _, _, _ = collect_registration_files(folder)
+    return [clean_confirmation_name(path) for path in registration_files]
 
 
 def required_page_count(item_count: int) -> int:
@@ -320,29 +379,64 @@ def run_registration(
     stamp_date: date,
     preview: bool = False,
 ) -> tuple[int, int]:
-    """生成登记表，返回（PDF 数量，登记表页数）。"""
+    """生成登记表，返回（有效确认书数量，登记表页数）。"""
     pdf_folder = pdf_folder.expanduser().resolve()
     template_path = template_path.expanduser().resolve()
     output_path = output_path.expanduser().resolve()
 
     required_paths = [
-        (pdf_folder, "PDF 文件夹"),
+        (pdf_folder, "确认书文件夹"),
         (template_path, "登记表模板"),
     ]
     for path, description in required_paths:
         if not path.exists():
             raise RuntimeError(f"找不到{description}：{path}")
 
-    names = collect_names(pdf_folder)
+    (
+        registration_files,
+        included_words,
+        invalid_words,
+        shadowed_words,
+    ) = collect_registration_files(pdf_folder)
+    names = [clean_confirmation_name(path) for path in registration_files]
+
+    if invalid_words:
+        print(
+            "\nWord 命名格式异常（以下文件已跳过，不会写入登记表）：",
+            file=sys.stderr,
+        )
+        print(
+            "标准格式：公司名称_商品交易确认书_【HFSY】四位编号-"
+            "JY或FWJY-八位日期两位流水号.doc/.docx",
+            file=sys.stderr,
+        )
+        for path in invalid_words:
+            print(f"  [异常] {path.resolve()}", file=sys.stderr)
+
+    if shadowed_words:
+        print("\n以下 Word 已有同名 PDF，登记时不重复计入：")
+        for path in shadowed_words:
+            print(f"  [使用 PDF] {path.resolve()}")
+
     if not names:
-        raise RuntimeError(f"未在 {pdf_folder} 及其子文件夹中找到 PDF。")
+        raise RuntimeError(
+            f"未在 {pdf_folder} 及其子文件夹中找到可登记的 PDF 或合规 Word。"
+        )
 
     page_count = required_page_count(len(names))
-    for number, name in enumerate(names, start=1):
-        print(f"{number:>3}. {name}")
+    included_word_keys = {
+        os.path.normcase(str(path.resolve())) for path in included_words
+    }
+    for number, (path, name) in enumerate(zip(registration_files, names), start=1):
+        kind = "Word，待 merge.py 转换" if (
+            os.path.normcase(str(path.resolve())) in included_word_keys
+        ) else "PDF"
+        print(f"{number:>3}. [{kind}] {name}")
 
     print(
-        f"\nPDF 数量：{len(names)}\n"
+        f"\n有效确认书数量：{len(names)}\n"
+        f"其中待转换 Word：{len(included_words)}\n"
+        f"跳过的异常 Word：{len(invalid_words)}\n"
         f"需要页数：{page_count}（每页最多 23 条）\n"
         f"盖章日期：{stamp_date:%Y-%m-%d}\n"
         f"输出文件：{output_path}"

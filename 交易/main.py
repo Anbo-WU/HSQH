@@ -683,16 +683,26 @@ def run_after_flow(
                 ) if paths.split_output_folder.is_dir() else 0
                 if available_count < 1:
                     print(
-                        "当前拆分目录中没有可供 scan.py 使用的 PDF，"
-                        "无法 continue。"
+                        "本次异常前没有生成任何可安全使用的拆分 PDF，"
+                        "因此无法 continue；请选择 resplit 或 stop。"
                     )
                     if on_split_issue != "ask":
                         return "stopped"
                     continue
                 split_count = available_count
+                issue_count = 0
+                manifest_path = paths.split_output_folder / "拆分记录.json"
+                if manifest_path.is_file():
+                    try:
+                        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                        issues = manifest.get("issues", [])
+                        if isinstance(issues, list):
+                            issue_count = len(issues)
+                    except (OSError, json.JSONDecodeError):
+                        pass
                 print(
-                    f"已选择 continue：将使用拆分目录中现有的 "
-                    f"{available_count} 个 PDF。"
+                    f"已选择 continue：将跳过 {issue_count} 项拆分异常，"
+                    f"使用其余 {available_count} 个 PDF 继续执行 scan.py。"
                 )
                 break
             if should_resplit:

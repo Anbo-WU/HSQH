@@ -1,0 +1,49 @@
+[
+  {
+    "run_id": "20260825_135305_347957",
+    "teacher": "Zhang",
+    "flow": "A",
+    "task_date": "2026-08-25",
+    "scan_date": "2026-08-25",
+    "batch": "01",
+    "status": "success",
+    "started_at": "2026-08-25T13:53:05+08:00",
+    "finished_at": "2026-08-25T13:53:27+08:00",
+    "elapsed_seconds": 22.203,
+    "paths": {
+      "confirmation_folder": "/Users/anbosmac/Desktop/occupation/trader/Zhang/确认书文件",
+      "registration_output": "/Users/anbosmac/Desktop/occupation/trader/Zhang/登记表文件/登记表_Zhang_20260825_01.xls",
+      "merged_pdf_output": "/Users/anbosmac/Desktop/occupation/trader/Zhang/合并PDF/确认书合并_Zhang_20260825_01.pdf",
+      "desktop_registration_output": "/Users/anbosmac/Desktop/登记表_Zhang_20260825_01.xls",
+      "desktop_merged_pdf_output": "/Users/anbosmac/Desktop/确认书合并_Zhang_20260825_01.pdf",
+      "scanned_folder": "/Users/anbosmac/Desktop/occupation/trader/Zhang/确认书扫描",
+      "scan_source_pdf": "/Users/anbosmac/Desktop/occupation/trader/Zhang/确认书扫描/0825.pdf",
+      "split_output_folder": "/Users/anbosmac/Desktop/occupation/trader/Zhang/确认书扫描/扫描件_0825_Zhang_01",
+      "desktop_scan_zip_output": "/Users/anbosmac/Desktop/扫描件_0825_Zhang_01.zip"
+    },
+    "programs": [
+      {
+        "program": "precheck.py",
+        "status": "success",
+        "started_at": "2026-08-25T13:53:05+08:00",
+        "finished_at": "2026-08-25T13:53:05+08:00",
+        "elapsed_seconds": 0.004,
+        "detail": "第 1 次检查"
+      },
+      {
+        "program": "registration.py",
+        "status": "success",
+        "started_at": "2026-08-25T13:53:05+08:00",
+        "finished_at": "2026-08-25T13:53:05+08:00",
+        "elapsed_seconds": 0.066
+      },
+      {
+        "program": "merge.py",
+        "status": "success",
+        "started_at": "2026-08-25T13:53:05+08:00",
+        "finished_at": "2026-08-25T13:53:27+08:00",
+        "elapsed_seconds": 22.133
+      }
+    ]
+  }
+]
