@@ -2,12 +2,14 @@
 """递归扫描指定确认书文件夹，转换 Word 文档并按自然顺序合并全部 PDF。
 
 Word 转 PDF 使用本机 WPS 的原生排版引擎；macOS 上的 PDF 合并优先使用
-系统 PDFKit，因此通常不需要额外安装 Python 包。
+系统 PDFKit，因此通常不需要额外安装 Python 包。合并前会把每份确认书
+调整为偶数页：删除奇数页 PDF 的空白尾页，否则补入一张空白页。
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -195,6 +197,96 @@ guard arguments.count >= 2 else {
 let outputURL = URL(fileURLWithPath: arguments[0])
 let merged = PDFDocument()
 var outputPageIndex = 0
+var reports: [[String: Any]] = []
+
+func isVisuallyBlank(_ page: PDFPage) -> Bool {
+    let pageBounds = page.bounds(for: .cropBox)
+    guard pageBounds.width > 0, pageBounds.height > 0 else {
+        return false
+    }
+
+    // Render the page instead of relying on extracted text: signatures, stamps,
+    // scanned images and vector graphics may not have a text layer.
+    let longestSide: CGFloat = 1000
+    let scale = min(longestSide / max(pageBounds.width, pageBounds.height), 2)
+    let width = max(1, Int(ceil(pageBounds.width * scale)))
+    let height = max(1, Int(ceil(pageBounds.height * scale)))
+    let thumbnail = page.thumbnail(
+        of: NSSize(width: width, height: height),
+        for: .cropBox
+    )
+    var proposedRect = NSRect(origin: .zero, size: thumbnail.size)
+    guard let image = thumbnail.cgImage(
+        forProposedRect: &proposedRect,
+        context: nil,
+        hints: nil
+    ) else {
+        return false
+    }
+
+    var pixels = [UInt8](repeating: 255, count: width * height)
+    let rendered = pixels.withUnsafeMutableBytes { buffer -> Bool in
+        guard let context = CGContext(
+            data: buffer.baseAddress,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width,
+            space: CGColorSpaceCreateDeviceGray(),
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
+        ) else {
+            return false
+        }
+        context.setFillColor(gray: 1, alpha: 1)
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        context.interpolationQuality = .high
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return true
+    }
+    guard rendered else {
+        return false
+    }
+
+    // Allow only a handful of antialiasing pixels. This deliberately errs on
+    // the side of retaining a page whenever any visible content is present.
+    let inkPixels = pixels.reduce(into: 0) { count, value in
+        if value < 250 { count += 1 }
+    }
+    let allowance = max(8, pixels.count / 200_000)
+    return inkPixels <= allowance
+}
+
+func makeBlankPage(matching page: PDFPage) -> PDFPage? {
+    let originalBounds = page.bounds(for: .mediaBox)
+    guard originalBounds.width > 0, originalBounds.height > 0 else {
+        return nil
+    }
+
+    var mediaBox = CGRect(
+        x: 0,
+        y: 0,
+        width: originalBounds.width,
+        height: originalBounds.height
+    )
+    let data = NSMutableData()
+    guard
+        let consumer = CGDataConsumer(data: data as CFMutableData),
+        let context = CGContext(consumer: consumer, mediaBox: &mediaBox, nil)
+    else {
+        return nil
+    }
+    context.beginPDFPage(nil)
+    context.endPDFPage()
+    context.closePDF()
+
+    guard
+        let document = PDFDocument(data: data as Data),
+        let blankPage = document.page(at: 0)
+    else {
+        return nil
+    }
+    return blankPage
+}
 
 for inputPath in arguments.dropFirst() {
     let inputURL = URL(fileURLWithPath: inputPath)
@@ -204,20 +296,74 @@ for inputPath in arguments.dropFirst() {
     guard document.pageCount > 0 else {
         fail("PDF 没有页面：\(inputPath)", code: 4)
     }
-    for pageIndex in 0..<document.pageCount {
+
+    let originalPageCount = document.pageCount
+    var pagesToCopy = originalPageCount
+    var shouldAppendBlank = false
+    var action = "unchanged"
+
+    if originalPageCount % 2 == 1 {
+        guard let lastPage = document.page(at: originalPageCount - 1) else {
+            fail("无法读取 PDF 最后一页：\(inputPath)", code: 5)
+        }
+        if isVisuallyBlank(lastPage) {
+            if originalPageCount == 1 {
+                fail("唯一一页是空白页，无法作为确认书合并：\(inputPath)", code: 7)
+            }
+            pagesToCopy -= 1
+            action = "removed_blank"
+        } else {
+            shouldAppendBlank = true
+            action = "added_blank"
+        }
+    }
+
+    for pageIndex in 0..<pagesToCopy {
         guard let page = document.page(at: pageIndex) else {
             fail("无法读取 PDF 第 \(pageIndex + 1) 页：\(inputPath)", code: 5)
         }
         merged.insert(page, at: outputPageIndex)
         outputPageIndex += 1
     }
+
+    if shouldAppendBlank {
+        guard
+            let lastPage = document.page(at: originalPageCount - 1),
+            let blankPage = makeBlankPage(matching: lastPage)
+        else {
+            fail("无法生成同尺寸空白页：\(inputPath)", code: 8)
+        }
+        merged.insert(blankPage, at: outputPageIndex)
+        outputPageIndex += 1
+    }
+
+    let normalizedPageCount = pagesToCopy + (shouldAppendBlank ? 1 : 0)
+    guard normalizedPageCount % 2 == 0 else {
+        fail("奇偶页校验失败：\(inputPath)", code: 9)
+    }
+    reports.append([
+        "path": inputPath,
+        "original_pages": originalPageCount,
+        "output_pages": normalizedPageCount,
+        "action": action,
+    ])
 }
 
 guard merged.write(to: outputURL) else {
     fail("无法写入合并后的 PDF：\(outputURL.path)", code: 6)
 }
 
-print(outputPageIndex)
+let result: [String: Any] = [
+    "page_count": outputPageIndex,
+    "reports": reports,
+]
+guard
+    let jsonData = try? JSONSerialization.data(withJSONObject: result),
+    let jsonText = String(data: jsonData, encoding: .utf8)
+else {
+    fail("无法生成合并报告", code: 10)
+}
+print(jsonText)
 '''
 
 
@@ -526,7 +672,10 @@ def planned_pdfs(current_pdfs: list[Path], word_files: list[Path], root: Path) -
     return sorted(by_path.values(), key=lambda path: natural_path_key(path, root))
 
 
-def merge_with_pdfkit(pdfs: list[Path], temporary_output: Path) -> int:
+def merge_with_pdfkit(
+    pdfs: list[Path],
+    temporary_output: Path,
+) -> tuple[int, list[dict[str, object]]]:
     swiftc = shutil.which("swiftc")
     if swiftc is None or sys.platform != "darwin":
         raise FileNotFoundError("当前系统不能使用 macOS PDFKit")
@@ -558,10 +707,54 @@ def merge_with_pdfkit(pdfs: list[Path], temporary_output: Path) -> int:
     )
     if merge_result.returncode != 0:
         raise RuntimeError(merge_result.stderr.strip() or "PDFKit 合并失败")
-    return int(merge_result.stdout.strip())
+    try:
+        result = json.loads(merge_result.stdout)
+        page_count = int(result["page_count"])
+        reports = result["reports"]
+        if not isinstance(reports, list):
+            raise TypeError
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("PDFKit 合并组件返回了无效的校验报告") from exc
+    return page_count, reports
 
 
-def merge_with_python(pdfs: list[Path], temporary_output: Path) -> int:
+def python_page_is_blank(page: object) -> bool:
+    """Conservatively detect an empty page when PDFKit is unavailable."""
+    try:
+        extract_text = getattr(page, "extract_text")
+        if (extract_text() or "").strip():
+            return False
+
+        get = getattr(page, "get")
+        if get("/Annots"):
+            return False
+
+        get_contents = getattr(page, "get_contents")
+        contents = get_contents()
+        if contents is None:
+            return True
+        operations = getattr(contents, "operations", None)
+        if operations is None:
+            return not bool(contents.get_data().strip())
+
+        # These operators paint text, images, shading or paths. State changes
+        # and path construction alone do not make a page visible.
+        painting_operators = {
+            b"Tj", b"TJ", b"'", b'"',
+            b"S", b"s", b"f", b"F", b"f*",
+            b"B", b"B*", b"b", b"b*",
+            b"Do", b"sh", b"INLINE IMAGE",
+        }
+        return not any(operator in painting_operators for _, operator in operations)
+    except Exception:
+        # Uncertainty must never cause a possibly meaningful page to be deleted.
+        return False
+
+
+def merge_with_python(
+    pdfs: list[Path],
+    temporary_output: Path,
+) -> tuple[int, list[dict[str, object]]]:
     try:
         from pypdf import PdfReader, PdfWriter  # type: ignore[import-not-found]
     except ImportError:
@@ -574,6 +767,7 @@ def merge_with_python(pdfs: list[Path], temporary_output: Path) -> int:
 
     writer = PdfWriter()
     page_count = 0
+    reports: list[dict[str, object]] = []
     try:
         for path in pdfs:
             reader = PdfReader(str(path))
@@ -582,16 +776,92 @@ def merge_with_python(pdfs: list[Path], temporary_output: Path) -> int:
                     reader.decrypt("")
                 except Exception as exc:
                     raise RuntimeError(f"PDF 已加密，无法读取：{path}") from exc
-            for page in reader.pages:
+            original_page_count = len(reader.pages)
+            if original_page_count < 1:
+                raise RuntimeError(f"PDF 没有页面：{path}")
+
+            pages_to_copy = original_page_count
+            should_append_blank = False
+            action = "unchanged"
+            last_page = reader.pages[-1]
+            if original_page_count % 2 == 1:
+                if python_page_is_blank(last_page):
+                    if original_page_count == 1:
+                        raise RuntimeError(
+                            f"唯一一页是空白页，无法作为确认书合并：{path}"
+                        )
+                    pages_to_copy -= 1
+                    action = "removed_blank"
+                else:
+                    should_append_blank = True
+                    action = "added_blank"
+
+            for page in reader.pages[:pages_to_copy]:
                 writer.add_page(page)
                 page_count += 1
+            if should_append_blank:
+                media_box = last_page.mediabox
+                blank_page = writer.add_blank_page(
+                    width=float(media_box.width),
+                    height=float(media_box.height),
+                )
+                rotation = int(last_page.get("/Rotate", 0) or 0) % 360
+                if rotation:
+                    rotate = getattr(blank_page, "rotate", None)
+                    if callable(rotate):
+                        rotate(rotation)
+                    else:
+                        blank_page.rotate_clockwise(rotation)
+                page_count += 1
+
+            output_page_count = pages_to_copy + int(should_append_blank)
+            if output_page_count % 2:
+                raise RuntimeError(f"奇偶页校验失败：{path}")
+            reports.append(
+                {
+                    "path": str(path.resolve()),
+                    "original_pages": original_page_count,
+                    "output_pages": output_page_count,
+                    "action": action,
+                }
+            )
         with temporary_output.open("wb") as output_file:
             writer.write(output_file)
     finally:
         close = getattr(writer, "close", None)
         if callable(close):
             close()
-    return page_count
+    return page_count, reports
+
+
+def print_page_adjustment_report(reports: list[dict[str, object]]) -> None:
+    removed = 0
+    added = 0
+    print("\n奇数页确认书处理：")
+    for report in reports:
+        action = report.get("action")
+        if action == "unchanged":
+            continue
+        path = Path(str(report.get("path", "")))
+        original_pages = report.get("original_pages")
+        output_pages = report.get("output_pages")
+        if action == "removed_blank":
+            removed += 1
+            label = "删除空白尾页"
+        elif action == "added_blank":
+            added += 1
+            label = "补入空白页"
+        else:
+            raise RuntimeError(f"未知的 PDF 页面处理结果：{action}")
+        print(
+            f"  [{label}] {path.name}（{original_pages} 页 -> {output_pages} 页）"
+        )
+    if not removed and not added:
+        print("  所有确认书原本均为偶数页，无需调整。")
+    print(
+        f"  汇总：删除 {removed} 个空白尾页，"
+        f"补入 {added} 个空白页。"
+    )
 
 
 def merge_pdfs(pdfs: list[Path], output: Path) -> int:
@@ -603,13 +873,16 @@ def merge_pdfs(pdfs: list[Path], output: Path) -> int:
     with tempfile.TemporaryDirectory(prefix=".merge_pdf_", dir=output.parent) as temp_name:
         temporary_output = Path(temp_name) / "merged.pdf"
         try:
-            page_count = merge_with_pdfkit(pdfs, temporary_output)
+            page_count, reports = merge_with_pdfkit(pdfs, temporary_output)
         except FileNotFoundError:
-            page_count = merge_with_python(pdfs, temporary_output)
+            page_count, reports = merge_with_python(pdfs, temporary_output)
 
         if not temporary_output.is_file() or temporary_output.stat().st_size == 0:
             raise RuntimeError("合并程序没有生成有效的输出文件。")
+        if page_count % 2:
+            raise RuntimeError("合并结果仍为奇数页，已停止输出。")
         os.replace(temporary_output, output)
+    print_page_adjustment_report(reports)
     return page_count
 
 
