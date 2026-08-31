@@ -32,6 +32,7 @@ class ConfirmationExtractionTest(unittest.TestCase):
 
     def test_template_fields(self) -> None:
         record = self.record
+        self.assertEqual(record.transaction_id, "【HFSY】0147-JY-2026082701")
         self.assertEqual(record.entry_price, Decimal("12505.00"))
         self.assertEqual(record.nominal_quantity, Decimal("192.00"))
         self.assertEqual(record.nominal_principal, Decimal("2400960.00"))
@@ -44,8 +45,32 @@ class ConfirmationExtractionTest(unittest.TestCase):
 
     def test_production_discovery_excludes_template(self) -> None:
         files = app.discover_pdfs(HERE)
-        self.assertEqual(len(files), 7)
         self.assertNotIn(self.template_path, files)
+
+        with tempfile.TemporaryDirectory(prefix="discovery_test_") as tempdir:
+            folder = Path(tempdir)
+            expected = [
+                folder / "任意名称.pdf",
+                folder / "客户_结算通知书_001.pdf",
+                folder / "客户_商品交易确认书_001.pdf",
+            ]
+            for name in (
+                *(path.name for path in expected),
+                "模板确认书.pdf",
+            ):
+                (folder / name).write_bytes(b"test")
+            self.assertEqual(app.discover_pdfs(folder), sorted(expected, key=lambda path: path.name))
+
+    def test_duplicate_pdf_content_is_processed_once(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="duplicate_test_") as tempdir:
+            folder = Path(tempdir)
+            first = folder / "任意名称A.pdf"
+            second = folder / "完全不同的名字B.pdf"
+            first.write_bytes(self.template_path.read_bytes())
+            second.write_bytes(self.template_path.read_bytes())
+            records = app.extract_all([first, second])
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0].source_file, first.name)
 
     def test_egg_contract_doubles_entry_price(self) -> None:
         egg_text = self.template_text.replace("LH2701", "JD2701")
@@ -66,6 +91,8 @@ class ConfirmationExtractionTest(unittest.TestCase):
             self.assertEqual(ws["AA6"].value, 1)
             self.assertEqual(ws["AA6"].number_format, "0.00%")
             self.assertEqual(ws["AC6"].number_format, "yyyy-mm-dd")
+            self.assertEqual(ws["AN6"].value, "【HFSY】0147-JY-2026082701")
+            self.assertEqual(ws["AN6"].number_format, "@")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""扫描商品交易确认书 PDF，并把结果写入统计表 U:AE。
+"""扫描商品交易确认书 PDF，并把结果写入统计表 U:AE 及 AN。
 
 默认行为：
 1. 扫描脚本所在目录中的 PDF，始终排除文件名含“模板确认书”的文件；
@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -52,6 +53,7 @@ TARGET_COLUMNS = {
     "AC": "入场时间",
     "AD": "交易确认书生效日",
     "AE": "交易确认书到期日",
+    "AN": "交易确认书编号",
 }
 
 
@@ -160,6 +162,7 @@ class ConfirmationData:
             "AC": self.signing_date.isoformat(),
             "AD": self.effective_date.isoformat(),
             "AE": self.expiry_date.isoformat(),
+            "AN": self.transaction_id,
         }
 
 
@@ -317,9 +320,11 @@ def parse_confirmation(text: str, source_file: str) -> ConfirmationData:
     section_mark = r"\s*[.．]\s*"
     date_pattern = r"(\d{4}\s*(?:年|[-/.])\s*\d{1,2}\s*(?:月|[-/.])\s*\d{1,2}\s*日?)"
 
-    transaction_id = clean_label_value(
-        require_match(r"交易编号\s*[:：]\s*([^\n]+)", text, "交易编号")
-    )
+    transaction_id = re.sub(
+        r"\s+",
+        "",
+        require_match(r"交易编号\s*[:：]\s*([^\n]+)", text, "交易编号"),
+    ).strip(" :：")
     signing_date = parse_date(
         require_match(r"签订时间\s*[:：]\s*" + date_pattern, text, "签订时间"),
         "签订时间",
@@ -419,10 +424,21 @@ def discover_pdfs(folder: Path) -> list[Path]:
 def extract_all(pdf_paths: Iterable[Path]) -> list[ConfirmationData]:
     results: list[ConfirmationData] = []
     failures: list[str] = []
+    seen_content: dict[str, str] = {}
     with PDFTextExtractor() as extractor:
         for pdf_path in pdf_paths:
             try:
-                results.append(parse_confirmation(extractor.extract(pdf_path), pdf_path.name))
+                text = extractor.extract(pdf_path)
+                fingerprint_source = re.sub(r"\s+", "", normalize_text(text))
+                fingerprint = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()
+                if fingerprint in seen_content:
+                    print(
+                        f"跳过重复 PDF：{pdf_path.name}（内容与 {seen_content[fingerprint]} 相同）",
+                        file=sys.stderr,
+                    )
+                    continue
+                seen_content[fingerprint] = pdf_path.name
+                results.append(parse_confirmation(text, pdf_path.name))
             except Exception as exc:
                 failures.append(f"{pdf_path.name}: {exc}")
     if failures:
@@ -510,10 +526,11 @@ def write_workbook(
         ws[f"AC{row}"] = record.signing_date
         ws[f"AD{row}"] = record.effective_date
         ws[f"AE{row}"] = record.expiry_date
+        ws[f"AN{row}"] = record.transaction_id
 
         for column in ("V", "W", "X", "Y"):
             ws[f"{column}{row}"].number_format = "0.00"
-        for column in ("U", "Z", "AB"):
+        for column in ("U", "Z", "AB", "AN"):
             ws[f"{column}{row}"].number_format = "@"
         ws[f"AA{row}"].number_format = "0.00%"
         for column in ("AC", "AD", "AE"):
@@ -543,7 +560,7 @@ def print_preview(records: Sequence[ConfirmationData], as_json: bool = False) ->
     if as_json:
         print(json.dumps(rows, ensure_ascii=False, indent=2))
         return
-    columns = ["文件", "交易编号", "U", "V", "W", "X", "Y", "Z", "AA", "AB", "AC", "AD", "AE"]
+    columns = ["文件", "交易编号", "U", "V", "W", "X", "Y", "Z", "AA", "AB", "AC", "AD", "AE", "AN"]
     print("\t".join(columns))
     for row in rows:
         print("\t".join(row[column] for column in columns))
@@ -557,7 +574,7 @@ def self_test(folder: Path) -> None:
         template_text = extractor.extract(template)
         actual = parse_confirmation(template_text, template.name)
     expected = {
-        "transaction_id": "HFSY0147-JY-2026082701",
+        "transaction_id": "【HFSY】0147-JY-2026082701",
         "entry_price": Decimal("12505.00"),
         "nominal_quantity": Decimal("192.00"),
         "nominal_principal": Decimal("2400960.00"),
@@ -595,7 +612,7 @@ def find_workbook(folder: Path, explicit: str | None) -> Path:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="扫描确认书并填充保期数据统计表 U:AE")
+    parser = argparse.ArgumentParser(description="扫描确认书并填充保期数据统计表 U:AE 及 AN")
     parser.add_argument("--folder", default=None, help="数据目录；默认是脚本所在目录")
     parser.add_argument("--workbook", default=None, help="统计表路径；默认自动寻找唯一原始 .xlsx")
     parser.add_argument("--output", default=None, help="输出路径；默认生成 *_已填充.xlsx")
@@ -616,7 +633,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     pdfs = discover_pdfs(folder)
     if not pdfs:
-        raise FileNotFoundError(f"{folder} 中没有找到真实确认书 PDF（模板会被排除）")
+        raise FileNotFoundError(f"{folder} 中没有找到真实确认书 PDF（模板确认书会被排除）")
     records = extract_all(pdfs)
     if args.preview:
         print_preview(records, as_json=args.json)
@@ -639,7 +656,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         force=args.force,
     )
     print(f"完成：{len(records)} 份确认书已写入 {output_path}")
-    print(f"工作表：{sheet_name}；范围：U{first_row}:AE{last_row}；模板确认书未参与生产扫描。")
+    print(
+        f"工作表：{sheet_name}；范围：U{first_row}:AE{last_row}、AN{first_row}:AN{last_row}；"
+        "模板确认书未参与生产扫描。"
+    )
     return 0
 
 
