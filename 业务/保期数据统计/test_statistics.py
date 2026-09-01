@@ -15,7 +15,7 @@ sys.path.insert(0, str(HERE))
 
 from openpyxl import load_workbook
 
-import 扫描确认书填充数据统计表 as app
+import statistics as app
 
 
 class ConfirmationExtractionTest(unittest.TestCase):
@@ -42,6 +42,18 @@ class ConfirmationExtractionTest(unittest.TestCase):
         self.assertEqual(record.signing_date, date(2026, 8, 27))
         self.assertEqual(record.effective_date, date(2026, 8, 28))
         self.assertEqual(record.expiry_date, date(2026, 10, 28))
+
+    def test_transaction_id_stops_when_chinese_text_restarts(self) -> None:
+        joined_header_text = self.template_text.replace("\n签订时间", "签订时间", 1)
+        record = app.parse_confirmation(joined_header_text, "编号与签订时间粘连测试.pdf")
+        self.assertEqual(record.transaction_id, "【HFSY】0147-JY-2026082701")
+
+    def test_option_fields_stop_at_next_section_on_same_line(self) -> None:
+        joined_option_text = self.template_text.replace(
+            "【看跌】\n3.2", "【看跌】 3.2", 1
+        ).replace("【增强亚式】\n4、", "【亚式】 4、", 1)
+        record = app.parse_confirmation(joined_option_text, "期权字段与后续章节粘连测试.pdf")
+        self.assertEqual(record.otc_option_type, "亚式看跌")
 
     def test_production_discovery_excludes_template(self) -> None:
         files = app.discover_pdfs(HERE)
@@ -80,7 +92,7 @@ class ConfirmationExtractionTest(unittest.TestCase):
         self.assertEqual(record.nominal_principal, Decimal("4801920.00"))
 
     def test_writes_second_data_row_with_formula_and_formats(self) -> None:
-        source = HERE / "保期数据统计表.xlsx"
+        source = HERE / "确认书" / "保期数据统计表.xlsx"
         with tempfile.TemporaryDirectory(prefix="confirmation_test_") as tempdir:
             output = Path(tempdir) / "result.xlsx"
             sheet, first_row, last_row = app.write_workbook(source, output, [self.record])
@@ -93,6 +105,59 @@ class ConfirmationExtractionTest(unittest.TestCase):
             self.assertEqual(ws["AC6"].number_format, "yyyy-mm-dd")
             self.assertEqual(ws["AN6"].value, "【HFSY】0147-JY-2026082701")
             self.assertEqual(ws["AN6"].number_format, "@")
+
+
+class SettlementExtractionTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.extractor = app.PDFTextExtractor()
+        cls.sample_path = sorted((HERE / "结算单").glob("*.pdf"))[0]
+        cls.sample_text = cls.extractor.extract(cls.sample_path)
+        cls.record = app.parse_settlement(cls.sample_text, cls.sample_path.name)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.extractor.close()
+
+    def test_sample_fields(self) -> None:
+        self.assertEqual(self.record.settlement_id, "【HFSY】0147-JS-2026082901")
+        self.assertTrue(self.record.has_payout)
+        self.assertEqual(self.record.payout_amount, Decimal("369151.75"))
+        self.assertEqual(self.record.settlement_price, Decimal("12073.91"))
+
+    def test_non_positive_amount_means_no_payout_and_zero(self) -> None:
+        for amount in ("0", "-123.456"):
+            with self.subTest(amount=amount):
+                text = self.sample_text.replace("369151.75", amount, 1)
+                record = app.parse_settlement(text, "非正数赔付测试.pdf")
+                self.assertFalse(record.has_payout)
+                self.assertEqual(record.payout_amount, Decimal("0.00"))
+
+    def test_values_round_to_two_places(self) -> None:
+        text = self.sample_text.replace("369151.75", "12.345", 1).replace(
+            "12073.91", "98.765", 1
+        )
+        record = app.parse_settlement(text, "小数位测试.pdf")
+        self.assertEqual(record.payout_amount, Decimal("12.35"))
+        self.assertEqual(record.settlement_price, Decimal("98.77"))
+
+    def test_writes_second_data_row_and_formats(self) -> None:
+        source = HERE / "结算单" / "保期数据统计表.xlsx"
+        with tempfile.TemporaryDirectory(prefix="settlement_test_") as tempdir:
+            output = Path(tempdir) / "result.xlsx"
+            sheet, first_row, last_row = app.write_settlement_workbook(
+                source, output, [self.record]
+            )
+            self.assertEqual((sheet, first_row, last_row), ("Sheet1", 6, 6))
+            ws = load_workbook(output, data_only=False)["Sheet1"]
+            self.assertEqual(ws["AO6"].value, "【HFSY】0147-JS-2026082901")
+            self.assertEqual(ws["BF6"].value, "是")
+            self.assertEqual(ws["BH6"].value, 369151.75)
+            self.assertEqual(ws["BJ6"].value, 12073.91)
+            self.assertEqual(ws["AO6"].number_format, "@")
+            self.assertEqual(ws["BF6"].number_format, "@")
+            self.assertEqual(ws["BH6"].number_format, "0.00")
+            self.assertEqual(ws["BJ6"].number_format, "0.00")
 
 
 if __name__ == "__main__":

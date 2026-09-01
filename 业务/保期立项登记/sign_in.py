@@ -24,7 +24,7 @@ except ImportError as exc:  # pragma: no cover - 给缺少依赖的环境更明�
     ) from exc
 
 
-FOLDERS = ("202611", "202612", "202613")
+FOLDERS = ("202617",)
 TARGET_NAME = "业务记录.xlsx"
 START_SERIAL = 23
 OUTPUT_COLUMNS = 15
@@ -357,7 +357,7 @@ def main() -> int:
 
     paths = source_files(root)
     if not paths:
-        raise FileNotFoundError("三个文件夹中没有找到 .xlsx 或 .xlsm 文件")
+        raise FileNotFoundError("文件夹中没有找到 .xlsx 或 .xlsm 文件")
 
     records: list[list[Any]] = []
     for index, path in enumerate(paths, start=START_SERIAL):
