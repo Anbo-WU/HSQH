@@ -16,3 +16,7 @@ venv/
 # Temporary files created during processing
 *.tmp
 .*.tmp.xls
+
+# Local runtime history
+**/运行记录.json
+**/运行记录.jsonl
