@@ -5,6 +5,10 @@
 【HFSY】0009-FWJY-2026072401
 -> 【HFSY】0009-FWJY-202607240120260724.pdf
 
+特殊分段编号也会保留：
+【HFSY】0009-FWJY-2026072401-1
+-> 【HFSY】0009-FWJY-2026072401-120260724.pdf
+
 Windows 版使用本地 RapidOCR 和 ONNX Runtime，不依赖 macOS Vision。
 """
 
@@ -22,6 +26,7 @@ from windows_ocr import recognize_first_pages
 
 
 OCR_SEPARATOR = r"[\s._·•,，:：/\\\-‐‑‒–—−]*"
+OCR_SUFFIX_SEPARATOR = r"[\s._·•,，:：/\\]*[-‐‑‒–—−]+[\s._·•,，:：/\\]*"
 TRANSACTION_PATTERN = re.compile(
     r"(?<![0-9A-Z])([0-9OQILSZBGD|]{4})"
     + OCR_SEPARATOR
@@ -33,7 +38,12 @@ TRANSACTION_PATTERN = re.compile(
     + OCR_SEPARATOR
     + r"[A-Z])?)"
     + OCR_SEPARATOR
-    + r"([0-9OQILSZBGD|]{10})(?![0-9A-Z])",
+    + r"([0-9OQILSZBGD|]{10})"
+    + r"(?:"
+    + OCR_SUFFIX_SEPARATOR
+    + r"([0-9OQILSZBGD|]+)"
+    + r")?"
+    + r"(?![0-9A-Z])",
     flags=re.IGNORECASE,
 )
 OCR_DIGIT_TRANSLATION = str.maketrans(
@@ -114,20 +124,32 @@ def normalize_trade_type(raw_type: str, expected_type: str | None) -> str | None
 
 def extract_transaction_number(text: str, pdf_name: str) -> str:
     matches = {
-        (match.group(1), match.group(2).upper(), match.group(3))
+        (
+            match.group(1),
+            match.group(2).upper(),
+            match.group(3),
+            match.group(4) or "",
+        )
         for match in TRANSACTION_PATTERN.finditer(text)
     }
     if len(matches) != 1:
         detail = "未识别到" if not matches else "识别到多个候选编号"
         raise ValueError(f"{pdf_name}: {detail}")
 
-    company_code, raw_trade_type, serial = matches.pop()
+    company_code, raw_trade_type, serial, raw_suffix = matches.pop()
     company_code = company_code.upper().translate(OCR_DIGIT_TRANSLATION)
     trade_type = normalize_trade_type(raw_trade_type, expected_trade_type(text))
     serial = serial.upper().translate(OCR_DIGIT_TRANSLATION)
-    if not company_code.isdigit() or trade_type is None or not serial.isdigit():
+    suffix = raw_suffix.upper().translate(OCR_DIGIT_TRANSLATION)
+    if (
+        not company_code.isdigit()
+        or trade_type is None
+        or not serial.isdigit()
+        or (suffix and not suffix.isdigit())
+    ):
         raise ValueError(f"{pdf_name}: 交易编号包含无法安全纠正的字符")
-    return f"【HFSY】{company_code}-{trade_type}-{serial}"
+    suffix_text = f"-{suffix}" if suffix else ""
+    return f"【HFSY】{company_code}-{trade_type}-{serial}{suffix_text}"
 
 
 def build_plans(pdfs: list[Path], recognized: dict[Path, str]) -> list[RenamePlan]:
@@ -139,9 +161,12 @@ def build_plans(pdfs: list[Path], recognized: dict[Path, str]) -> list[RenamePla
                 recognized[source.resolve()],
                 source.name,
             )
-            # 编号末尾 10 位是 YYYYMMDDNN，去掉最后 2 位得到 YYYYMMDD。
-            serial = number.rsplit("-", maxsplit=1)[1]
-            date_suffix = serial[-10:-2]
+            # 主编号中的 10 位流水号是 YYYYMMDDNN；末尾可能还有 -1、-2
+            # 等项目分段，不能用最后一个短横线直接切流水号。
+            serial_match = re.search(r"-(\d{10})(?:-\d+)?$", number)
+            if serial_match is None:
+                raise ValueError(f"{source.name}: 无法从交易编号提取日期")
+            date_suffix = serial_match.group(1)[:-2]
             target = source.with_name(f"{number}{date_suffix}.pdf")
             plans.append(RenamePlan(source, target, number))
         except (KeyError, ValueError) as exc:

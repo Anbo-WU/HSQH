@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""OCR 识别整本盖章扫描件，并按确认书边界拆分为独立 PDF。
+"""把整本盖章扫描件拆分为独立 PDF。
 
 支持两种固定格式：
 - 场外（商品）期权交易确认书：4 页；
 - 场外商品远期交易确认书：2 页。
+
+Pan 结算单使用 A 登记表中的原文件名和原文件页数直接拆分，不运行 OCR。
 
 Windows 版使用 RapidOCR、ONNX Runtime、PyMuPDF 和 pypdf，不依赖
 macOS PDFKit、Vision、AppKit 或 Swift。
@@ -94,6 +96,14 @@ class SplitPlan:
     @property
     def page_count(self) -> int:
         return self.end_page - self.start_page + 1
+
+
+@dataclass(frozen=True)
+class NamedDocument:
+    """无需 OCR 命名时，由 A 功能原文件提供的文件名和固定页数。"""
+
+    filename: str
+    page_count: int
 
 
 @dataclass(frozen=True)
@@ -397,10 +407,15 @@ def print_plans(
     print(f"拆分输出目录：{output_folder}")
     print("\n拆分计划：")
     for plan in plans:
+        verification = (
+            "原文件页数已匹配"
+            if plan.kind == "按 A 原文件名拆分"
+            else f"末页盖章OCR={'已确认' if plan.footer_confirmed else '未识别'}"
+        )
         print(
             f"  {plan.number:>3}. 第 {plan.start_page}-{plan.end_page} 页 "
             f"({plan.page_count} 页，{plan.kind}，"
-            f"末页盖章OCR={'已确认' if plan.footer_confirmed else '未识别'}) "
+            f"{verification}) "
             f"-> {plan.filename}"
         )
         print(f"       {plan.transaction_number}")
@@ -510,6 +525,118 @@ def write_split_pdfs(
     finally:
         if not completed and temp_path.exists():
             shutil.rmtree(temp_path)
+
+
+def run_named_split(
+    scan_folder: Path,
+    output_folder: Path,
+    documents: list[NamedDocument],
+    preview: bool = False,
+    scan_date: date | None = None,
+    source_pdf: Path | None = None,
+) -> tuple[int, int]:
+    """按 A 功能原文件的顺序、页数和名称拆分，不运行 OCR。"""
+    scan_folder = scan_folder.expanduser().resolve()
+    output_folder = output_folder.expanduser().resolve()
+    if not scan_folder.is_dir():
+        raise RuntimeError(f"找不到确认书扫描目录：{scan_folder}")
+    if not documents:
+        raise RuntimeError("A 批次登记表中没有可用于命名的文件。")
+
+    names: list[str] = []
+    seen_names: set[str] = set()
+    for document in documents:
+        filename = document.filename
+        if (
+            Path(filename).name != filename
+            or Path(filename).suffix.casefold() != ".pdf"
+            or filename in {".", ".."}
+        ):
+            raise RuntimeError(f"A 批次中存在不安全的 PDF 文件名：{filename!r}")
+        if document.page_count < 1:
+            raise RuntimeError(f"A 批次文件页数无效：{filename}={document.page_count}")
+        name_key = filename.casefold()
+        if name_key in seen_names:
+            raise RuntimeError(f"A 批次中存在重复文件名：{filename}")
+        seen_names.add(name_key)
+        names.append(filename)
+
+    effective_scan_date = scan_date or date.today()
+    source = resolve_source_pdf(scan_folder, effective_scan_date, source_pdf)
+    source_hash = file_sha256(source)
+    expected_count = len(documents)
+
+    existing_manifest = reusable_output(
+        output_folder,
+        source,
+        source_hash,
+        expected_count,
+    )
+    if existing_manifest is not None:
+        manifest_documents = existing_manifest.get("documents", [])
+        existing_names = [
+            item.get("filename")
+            for item in manifest_documents
+            if isinstance(item, dict)
+        ]
+        generated_names = sorted(
+            path.name
+            for path in output_folder.iterdir()
+            if path.is_file() and path.suffix.casefold() == ".pdf"
+        )
+        if existing_names != names or sorted(names) != generated_names:
+            raise RuntimeError(
+                f"已有拆分目录的文件名与 A 批次不一致，未覆盖：{output_folder}"
+            )
+        print(f"已有按原文件名拆分的结果可直接复用：{output_folder}")
+        return expected_count, 0
+
+    try:
+        reader = PdfReader(str(source), strict=False)
+        total_pages = len(reader.pages)
+    except Exception as exc:
+        raise RuntimeError(f"无法读取扫描 PDF：{source}") from exc
+
+    expected_pages = sum(document.page_count for document in documents)
+    if total_pages != expected_pages:
+        raise RuntimeError(
+            f"扫描 PDF 共 {total_pages} 页，但 A 批次 {expected_count} 份原文件"
+            f"合计 {expected_pages} 页；为防止文件名错位，未执行自动拆分。"
+        )
+
+    plans: list[SplitPlan] = []
+    start_page = 1
+    for number, document in enumerate(documents, start=1):
+        end_page = start_page + document.page_count - 1
+        plans.append(
+            SplitPlan(
+                number=number,
+                start_page=start_page,
+                end_page=end_page,
+                kind="按 A 原文件名拆分",
+                transaction_number=Path(document.filename).stem,
+                filename=document.filename,
+                footer_confirmed=False,
+            )
+        )
+        start_page = end_page + 1
+
+    print_plans(source, plans, [], output_folder, total_pages)
+    if preview:
+        print("\n预览完成：文件名和页数匹配，未生成拆分 PDF。")
+        return expected_count, total_pages
+
+    write_split_pdfs(
+        source,
+        output_folder,
+        plans,
+        [],
+        source_hash,
+        expected_count,
+        total_pages,
+    )
+    print(f"\n拆分完成：已按 A 原文件名生成 {expected_count} 个 PDF，无需 OCR 重命名。")
+    return expected_count, total_pages
 
 
 def run_split(

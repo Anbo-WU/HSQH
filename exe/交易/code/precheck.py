@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""递归检查“确认书文件”中的重名或疑似重复 PDF。"""
+"""递归检查确认书或 Pan 结算单中的重名、疑似重复及命名格式。"""
 
 from __future__ import annotations
 
@@ -18,10 +18,22 @@ from pathlib import Path
     flags=re.IGNORECASE,
 )
 
-# 标准示例：公司名称_商品交易确认书_【HFSY】0183-JY-2026080701.pdf
-标准文件名 = re.compile(
+# 确认书标准示例：公司名称_商品交易确认书_【HFSY】0183-JY-2026080701.pdf
+确认书标准文件名 = re.compile(
     r"^.+_商品交易确认书_【HFSY】\d{4}-(?:JY|FWJY)-\d{10}\.pdf$"
 )
+# Pan 的结算单在进入项目时已经是最终名称：交易编号后再附 8 位归档日期。
+# 示例：【HFSY】0147-JS-202608310420260831.pdf
+结算单标准文件名 = re.compile(
+    r"^【HFSY】\d{4}-JS-\d{10}\d{8}\.pdf$"
+)
+
+
+def 是标准文件名(文件名: str) -> bool:
+    return any(
+        pattern.fullmatch(文件名) is not None
+        for pattern in (确认书标准文件名, 结算单标准文件名)
+    )
 
 
 def 统一名称(文件名: str) -> str:
@@ -80,7 +92,14 @@ def 添加分组(分组: dict[str, list[Path]], 标题: str, 输出: list[str]) 
 def 添加异常文件(文件列表: list[Path], 输出: list[str]) -> int:
     输出.append(f"\n四、命名格式异常：{len(文件列表)} 个")
     输出.append("=" * 72)
-    输出.append("标准格式：公司名称_商品交易确认书_【HFSY】四位编号-JY或FWJY-八位日期两位流水号.pdf")
+    输出.append(
+        "标准格式一：公司名称_商品交易确认书_【HFSY】四位编号-"
+        "JY或FWJY-八位日期两位流水号.pdf"
+    )
+    输出.append(
+        "标准格式二：【HFSY】四位编号-JS-八位日期两位流水号"
+        "紧接八位归档日期.pdf（Pan 结算单）"
+    )
     if not 文件列表:
         输出.append("未发现。")
         return 0
@@ -103,7 +122,7 @@ def 检查PDF(检查目录: Path) -> tuple[str, int]:
     for 文件路径 in PDF列表:
         同名分组[统一名称(文件路径.name)].append(文件路径)
         疑似复制件分组[去掉复制件后缀(文件路径.name)].append(文件路径)
-        if 标准文件名.fullmatch(文件路径.name) is None:
+        if not 是标准文件名(文件路径.name):
             命名异常列表.append(文件路径)
 
         try:

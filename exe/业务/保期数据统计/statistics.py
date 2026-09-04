@@ -51,10 +51,14 @@ CONFIRMATION_COLUMNS = {
     "AC": "入场时间",
     "AD": "交易确认书生效日",
     "AE": "交易确认书到期日",
+    "BB": "执行价格",
+    "BN": "交易书结算价格",
     "AN": "交易确认书编号",
 }
 SETTLEMENT_COLUMNS = {
     "AO": "结算单编号",
+    "BB": "执行价格",
+    "BN": "交易书结算价格",
     "BF": "是否产生赔付",
     "BH": "期权赔付金额",
     "BJ": "理赔价格",
@@ -79,6 +83,9 @@ class ConfirmationData:
     effective_date: date
     expiry_date: date
     is_egg: bool
+    exercise_price: Decimal | None
+    pricing_description: str
+    pricing_warning: str | None = None
 
     def preview_dict(self) -> dict[str, str]:
         return {
@@ -95,6 +102,8 @@ class ConfirmationData:
             "AC": self.signing_date.isoformat(),
             "AD": self.effective_date.isoformat(),
             "AE": self.expiry_date.isoformat(),
+            "BB": f"{self.exercise_price:.2f}" if self.exercise_price is not None else "",
+            "BN": self.pricing_description,
             "AN": self.transaction_id,
         }
 
@@ -106,6 +115,9 @@ class SettlementData:
     has_payout: bool
     payout_amount: Decimal
     settlement_price: Decimal
+    exercise_price: Decimal | None
+    pricing_description: str
+    pricing_warning: str | None = None
 
     def preview_dict(self) -> dict[str, str]:
         return {
@@ -114,7 +126,31 @@ class SettlementData:
             "BF": "是" if self.has_payout else "否",
             "BH": f"{self.payout_amount:.2f}",
             "BJ": f"{self.settlement_price:.2f}",
+            "BB": f"{self.exercise_price:.2f}" if self.exercise_price is not None else "",
+            "BN": self.pricing_description,
         }
+
+
+@dataclass(frozen=True)
+class FailedDocument:
+    source_file: str
+    error_message: str
+
+    @property
+    def note(self) -> str:
+        return f"识别异常：{self.source_file}：{self.error_message}"
+
+
+@dataclass(frozen=True)
+class PricingTerms:
+    option_direction: str
+    description: str
+    exercise_price: Decimal | None
+    warning: str | None = None
+
+
+ConfirmationRecord = ConfirmationData | FailedDocument
+SettlementRecord = SettlementData | FailedDocument
 
 
 class PDFTextExtractor:
@@ -291,6 +327,102 @@ def clean_transaction_id(raw: str) -> str:
     return transaction_id
 
 
+def extract_option_type(text: str, section_mark: str) -> tuple[str, str]:
+    option_type = clean_label_value(
+        require_match(
+            r"3" + section_mark + r"1\s*[、,]?\s*期权类型\s*[:：]\s*"
+            r"([^\n]*?)(?=\s*3" + section_mark + r"2\s*[、,]?|\n|$)",
+            text,
+            "期权类型",
+        )
+    )
+    direction_match = re.search(r"看涨|看跌", option_type)
+    if not direction_match:
+        raise ValueError(f"期权类型中未找到看涨或看跌：{option_type!r}")
+    return option_type, direction_match.group(0)
+
+
+def clean_pricing_description(raw: str) -> str:
+    """去掉 PDF 断行造成的拆字，并保留便于阅读的 Max/Min 与单位空格。"""
+    description = re.sub(r"\s+", "", raw).strip(" :：;；")
+    description = re.sub(r"(?<![A-Za-z])(Max|Min)(?=【)", r" \1", description)
+    description = re.sub(r"(?<=\d)(?=元/吨)", " ", description)
+    return description
+
+
+def parse_pricing_terms(text: str, option_direction: str) -> PricingTerms:
+    """按 3.1 的看涨/看跌方向，从 5.4 选择对应结算价格描述及括号数值。"""
+    section_match = re.search(
+        r"5\s*[.．]\s*4\s*[、,]?\s*结算价格(?:计算方式)?\s*[:：]\s*"
+        r"([\s\S]*?)(?=\s*5\s*[.．]\s*5\s*[、,]?|$)",
+        text,
+    )
+    if not section_match:
+        return PricingTerms(
+            option_direction=option_direction,
+            description="",
+            exercise_price=None,
+            warning="未找到 5.4 结算价格描述",
+        )
+
+    section = section_match.group(1).strip()
+    branch_pattern = re.compile(
+        r"(?:[12]\s*[、.)．]?\s*)?(看涨|看跌)(?:期权)?\s*[:：]"
+    )
+    branches = list(branch_pattern.finditer(section))
+    selected = ""
+    warnings: list[str] = []
+    allow_numeric_extraction = True
+
+    matching_index = next(
+        (index for index, branch in enumerate(branches) if branch.group(1) == option_direction),
+        None,
+    )
+    if matching_index is not None:
+        branch = branches[matching_index]
+        end = (
+            branches[matching_index + 1].start()
+            if matching_index + 1 < len(branches)
+            else len(section)
+        )
+        selected = section[branch.end():end]
+    elif branches:
+        selected = section
+        allow_numeric_extraction = False
+        found = "、".join(branch.group(1) for branch in branches)
+        warnings.append(
+            f"5.4 中没有与 3.1“{option_direction}”匹配的分支（现有：{found}）"
+        )
+    else:
+        pricing_start = section.find("采价期间")
+        selected = section[pricing_start:] if pricing_start >= 0 else section
+        warnings.append("5.4 不是标准的看涨/看跌分支结构，已保留可识别描述")
+
+    description = clean_pricing_description(selected)
+    if not description:
+        description = clean_pricing_description(section)
+        warnings.append("5.4 选中分支没有可写入的描述")
+
+    exercise_price: Decimal | None = None
+    if allow_numeric_extraction:
+        compact = re.sub(r"\s+", "", selected)
+        number_match = re.search(
+            r"【[^】]*?[,，]([-+]?\d[\d,]*(?:\.\d+)?)元/吨】",
+            compact,
+        )
+        if number_match:
+            exercise_price = parse_decimal(number_match.group(1), "5.4 执行价格")
+        else:
+            warnings.append("5.4 描述中未找到“【...,数值 元/吨】”，BB 列将留空")
+
+    return PricingTerms(
+        option_direction=option_direction,
+        description=description,
+        exercise_price=exercise_price,
+        warning="；".join(dict.fromkeys(warnings)) or None,
+    )
+
+
 def parse_confirmation(text: str, source_file: str) -> ConfirmationData:
     text = normalize_text(text)
     section_mark = r"\s*[.．]\s*"
@@ -313,14 +445,8 @@ def parse_confirmation(text: str, source_file: str) -> ConfirmationData:
                       text, "到期日"),
         "到期日",
     )
-    option_type = clean_label_value(
-        require_match(
-            r"3" + section_mark + r"1\s*[、,]?\s*期权类型\s*[:：]\s*"
-            r"([^\n]*?)(?=\s*3" + section_mark + r"2\s*[、,]?|\n|$)",
-            text,
-            "期权类型",
-        )
-    )
+    option_type, option_direction = extract_option_type(text, section_mark)
+    pricing_terms = parse_pricing_terms(text, option_direction)
     option_structure = clean_label_value(
         require_match(
             r"3" + section_mark + r"2\s*[、,]?\s*期权结构\s*[:：]\s*"
@@ -389,6 +515,9 @@ def parse_confirmation(text: str, source_file: str) -> ConfirmationData:
         effective_date=effective_date,
         expiry_date=expiry_date,
         is_egg=is_egg,
+        exercise_price=pricing_terms.exercise_price,
+        pricing_description=pricing_terms.description,
+        pricing_warning=pricing_terms.warning,
     )
 
 
@@ -397,6 +526,9 @@ def parse_settlement(text: str, source_file: str) -> SettlementData:
     text = normalize_text(text)
     section_mark = r"\s*[.．]\s*"
     number_pattern = r"([-+−]?\s*[0-9][0-9,]*(?:\.\d+)?)"
+
+    _, option_direction = extract_option_type(text, section_mark)
+    pricing_terms = parse_pricing_terms(text, option_direction)
 
     # 只匹配独占行首的“编号”，避免误取正文中的“交易确认书编号”。
     settlement_id = clean_transaction_id(
@@ -427,6 +559,9 @@ def parse_settlement(text: str, source_file: str) -> SettlementData:
         has_payout=has_payout,
         payout_amount=payout_amount,
         settlement_price=settlement_price,
+        exercise_price=pricing_terms.exercise_price,
+        pricing_description=pricing_terms.description,
+        pricing_warning=pricing_terms.warning,
     )
 
 
@@ -441,9 +576,8 @@ def discover_pdfs(folder: Path) -> list[Path]:
     return sorted(pdfs, key=lambda path: path.name)
 
 
-def extract_all(pdf_paths: Iterable[Path]) -> list[ConfirmationData]:
-    results: list[ConfirmationData] = []
-    failures: list[str] = []
+def extract_all(pdf_paths: Iterable[Path]) -> list[ConfirmationRecord]:
+    results: list[ConfirmationRecord] = []
     seen_content: dict[str, str] = {}
     with PDFTextExtractor() as extractor:
         for pdf_path in pdf_paths:
@@ -458,17 +592,25 @@ def extract_all(pdf_paths: Iterable[Path]) -> list[ConfirmationData]:
                     )
                     continue
                 seen_content[fingerprint] = pdf_path.name
-                results.append(parse_confirmation(text, pdf_path.name))
+                record = parse_confirmation(text, pdf_path.name)
+                if record.pricing_warning:
+                    print(
+                        f"5.4 识别异常：{pdf_path.name}：{record.pricing_warning}",
+                        file=sys.stderr,
+                    )
+                results.append(record)
             except Exception as exc:
-                failures.append(f"{pdf_path.name}: {exc}")
-    if failures:
-        raise RuntimeError("以下确认书识别失败：\n- " + "\n- ".join(failures))
+                failure = FailedDocument(pdf_path.name, str(exc))
+                results.append(failure)
+                print(
+                    f"确认书识别异常，已在统计表保留一行：{failure.note}",
+                    file=sys.stderr,
+                )
     return results
 
 
-def extract_all_settlements(pdf_paths: Iterable[Path]) -> list[SettlementData]:
-    results: list[SettlementData] = []
-    failures: list[str] = []
+def extract_all_settlements(pdf_paths: Iterable[Path]) -> list[SettlementRecord]:
+    results: list[SettlementRecord] = []
     seen_content: dict[str, str] = {}
     with PDFTextExtractor() as extractor:
         for pdf_path in pdf_paths:
@@ -483,11 +625,20 @@ def extract_all_settlements(pdf_paths: Iterable[Path]) -> list[SettlementData]:
                     )
                     continue
                 seen_content[fingerprint] = pdf_path.name
-                results.append(parse_settlement(text, pdf_path.name))
+                record = parse_settlement(text, pdf_path.name)
+                if record.pricing_warning:
+                    print(
+                        f"5.4 识别异常：{pdf_path.name}：{record.pricing_warning}",
+                        file=sys.stderr,
+                    )
+                results.append(record)
             except Exception as exc:
-                failures.append(f"{pdf_path.name}: {exc}")
-    if failures:
-        raise RuntimeError("以下结算单识别失败：\n- " + "\n- ".join(failures))
+                failure = FailedDocument(pdf_path.name, str(exc))
+                results.append(failure)
+                print(
+                    f"结算单识别异常，已在统计表保留一行：{failure.note}",
+                    file=sys.stderr,
+                )
     return results
 
 
@@ -541,7 +692,7 @@ def copy_reference_format(
 def write_workbook(
     workbook_path: Path,
     output_path: Path,
-    records: Sequence[ConfirmationData],
+    records: Sequence[ConfirmationRecord],
     start_row_override: int | None = None,
     force: bool = False,
 ) -> tuple[str, int, int]:
@@ -562,7 +713,11 @@ def write_workbook(
     target_rows = range(start_row, start_row + len(records))
     conflicts: list[str] = []
     for row in target_rows:
-        occupied = [column for column in TARGET_COLUMNS if ws[f"{column}{row}"].value not in (None, "")]
+        occupied = [
+            column
+            for column in TARGET_COLUMNS
+            if ws[f"{column}{row}"].value not in (None, "")
+        ]
         if occupied:
             conflicts.append(f"第 {row} 行（{','.join(occupied)}）")
     if conflicts and not force:
@@ -573,6 +728,13 @@ def write_workbook(
     for offset, record in enumerate(records):
         row = start_row + offset
         copy_reference_format(ws, reference_row, row)
+        for column in TARGET_COLUMNS:
+            ws[f"{column}{row}"] = None
+        if isinstance(record, FailedDocument):
+            ws[f"AN{row}"] = record.note
+            ws[f"AN{row}"].number_format = "@"
+            continue
+
         ws[f"U{row}"] = record.hedge_method
         ws[f"V{row}"] = float(record.entry_price)
         ws[f"W{row}"] = float(record.nominal_quantity)
@@ -584,11 +746,15 @@ def write_workbook(
         ws[f"AC{row}"] = record.signing_date
         ws[f"AD{row}"] = record.effective_date
         ws[f"AE{row}"] = record.expiry_date
+        ws[f"BB{row}"] = (
+            float(record.exercise_price) if record.exercise_price is not None else None
+        )
+        ws[f"BN{row}"] = record.pricing_description
         ws[f"AN{row}"] = record.transaction_id
 
-        for column in ("V", "W", "X", "Y"):
+        for column in ("V", "W", "X", "Y", "BB"):
             ws[f"{column}{row}"].number_format = "0.00"
-        for column in ("U", "Z", "AB", "AN"):
+        for column in ("U", "Z", "AB", "AN", "BN"):
             ws[f"{column}{row}"].number_format = "@"
         ws[f"AA{row}"].number_format = "0.00%"
         for column in ("AC", "AD", "AE"):
@@ -616,7 +782,7 @@ def write_workbook(
 def write_settlement_workbook(
     workbook_path: Path,
     output_path: Path,
-    records: Sequence[SettlementData],
+    records: Sequence[SettlementRecord],
     start_row_override: int | None = None,
     force: bool = False,
 ) -> tuple[str, int, int]:
@@ -653,14 +819,25 @@ def write_settlement_workbook(
     for offset, record in enumerate(records):
         row = start_row + offset
         copy_reference_format(ws, reference_row, row, SETTLEMENT_COLUMNS)
+        for column in SETTLEMENT_COLUMNS:
+            ws[f"{column}{row}"] = None
+        if isinstance(record, FailedDocument):
+            ws[f"AO{row}"] = record.note
+            ws[f"AO{row}"].number_format = "@"
+            continue
+
         ws[f"AO{row}"] = record.settlement_id
+        ws[f"BB{row}"] = (
+            float(record.exercise_price) if record.exercise_price is not None else None
+        )
+        ws[f"BN{row}"] = record.pricing_description
         ws[f"BF{row}"] = "是" if record.has_payout else "否"
         ws[f"BH{row}"] = float(record.payout_amount)
         ws[f"BJ{row}"] = float(record.settlement_price)
 
-        for column in ("AO", "BF"):
+        for column in ("AO", "BF", "BN"):
             ws[f"{column}{row}"].number_format = "@"
-        for column in ("BH", "BJ"):
+        for column in ("BB", "BH", "BJ"):
             ws[f"{column}{row}"].number_format = "0.00"
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -678,25 +855,45 @@ def write_settlement_workbook(
     return ws.title, start_row, start_row + len(records) - 1
 
 
-def print_preview(records: Sequence[ConfirmationData], as_json: bool = False) -> None:
-    rows = [record.preview_dict() for record in records]
+def print_preview(records: Sequence[ConfirmationRecord], as_json: bool = False) -> None:
+    columns = [
+        "文件", "交易编号", "U", "V", "W", "X", "Y", "Z", "AA", "AB",
+        "AC", "AD", "AE", "BB", "BN", "AN",
+    ]
+    rows: list[dict[str, str]] = []
+    for record in records:
+        if isinstance(record, FailedDocument):
+            row = {column: "" for column in columns}
+            row["文件"] = record.source_file
+            row["交易编号"] = "识别异常"
+            row["AN"] = record.note
+            rows.append(row)
+        else:
+            rows.append(record.preview_dict())
     if as_json:
         print(json.dumps(rows, ensure_ascii=False, indent=2))
         return
-    columns = ["文件", "交易编号", "U", "V", "W", "X", "Y", "Z", "AA", "AB", "AC", "AD", "AE", "AN"]
     print("\t".join(columns))
     for row in rows:
         print("\t".join(row[column] for column in columns))
 
 
 def print_settlement_preview(
-    records: Sequence[SettlementData], as_json: bool = False
+    records: Sequence[SettlementRecord], as_json: bool = False
 ) -> None:
-    rows = [record.preview_dict() for record in records]
+    columns = ["文件", "AO", "BB", "BN", "BF", "BH", "BJ"]
+    rows: list[dict[str, str]] = []
+    for record in records:
+        if isinstance(record, FailedDocument):
+            row = {column: "" for column in columns}
+            row["文件"] = record.source_file
+            row["AO"] = record.note
+            rows.append(row)
+        else:
+            rows.append(record.preview_dict())
     if as_json:
         print(json.dumps(rows, ensure_ascii=False, indent=2))
         return
-    columns = ["文件", "AO", "BF", "BH", "BJ"]
     print("\t".join(columns))
     for row in rows:
         print("\t".join(row[column] for column in columns))
@@ -846,7 +1043,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"完成：{len(confirmation_records)} 份确认书已写入 {output_path}")
         print(
             f"工作表：{sheet_name}；范围：U{first_row}:AE{last_row}、"
-            f"AN{first_row}:AN{last_row}。"
+            f"AN{first_row}:AN{last_row}、BB{first_row}:BB{last_row}、"
+            f"BN{first_row}:BN{last_row}。"
         )
     else:
         sheet_name, first_row, last_row = write_settlement_workbook(
@@ -860,7 +1058,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             f"工作表：{sheet_name}；范围：AO{first_row}:AO{last_row}、"
             f"BF{first_row}:BF{last_row}、BH{first_row}:BH{last_row}、"
-            f"BJ{first_row}:BJ{last_row}。"
+            f"BJ{first_row}:BJ{last_row}、BB{first_row}:BB{last_row}、"
+            f"BN{first_row}:BN{last_row}。"
         )
     return 0
 

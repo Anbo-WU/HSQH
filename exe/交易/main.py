@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""按人员统一运行确认书处理流程。"""
+"""按人员统一运行确认书或 Pan 结算单处理流程。"""
 
 from __future__ import annotations
 
@@ -21,7 +21,8 @@ from typing import Callable, TypeVar
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 CODE_FOLDER = PROJECT_ROOT / "code"
-TEACHERS = ("LuX", "Tan", "Zhang", "LuT")
+TEACHERS = ("LuX", "Tan", "Zhang", "LuT", "Pan")
+SOURCE_NAMED_TEACHERS = {"Pan"}
 
 # 功能脚本仍可独立运行；总入口通过它们公开的函数传入本次任务路径。
 sys.path.insert(0, str(CODE_FOLDER))
@@ -203,27 +204,71 @@ def latest_completed_batch(teacher: str) -> tuple[date, int] | None:
     return task_date, batch
 
 
-def registration_output_count(path: Path) -> int:
-    """读取选中 A 批次的登记表，作为 B 拆分数量校验基准。"""
+def registration_output_names(path: Path) -> list[str]:
+    """读取选中 A 批次登记表中的文件名称，保留登记顺序。"""
     xlrd, _, _, _ = registration_program.load_xls_modules()
     workbook = xlrd.open_workbook(str(path), formatting_info=True)
     if workbook.nsheets < 1:
         raise RuntimeError(f"A 批次登记表没有工作表：{path}")
     sheet = workbook.sheet_by_index(0)
-    count = 0
+    names: list[str] = []
     for page_start in range(0, sheet.nrows, registration_program.TEMPLATE_ROW_COUNT):
         first_row = page_start + registration_program.START_ROW - 1
         last_row = min(
             page_start + registration_program.DATA_END_ROW,
             sheet.nrows,
         )
-        count += sum(
-            bool(str(sheet.cell_value(row, registration_program.NAME_COLUMN_INDEX)).strip())
+        names.extend(
+            name
             for row in range(first_row, last_row)
+            if (
+                name := str(
+                    sheet.cell_value(row, registration_program.NAME_COLUMN_INDEX)
+                ).strip()
+            )
         )
-    if count < 1:
+    if not names:
         raise RuntimeError(f"A 批次登记表中没有确认书记录：{path}")
-    return count
+    return names
+
+
+def registration_output_count(path: Path) -> int:
+    """兼容原有调用：返回选中 A 批次的登记记录数量。"""
+    return len(registration_output_names(path))
+
+
+def named_split_documents(paths: TaskPaths, names: list[str]) -> list[split_program.NamedDocument]:
+    """把 A 登记表名称映射回原 PDF，供 Pan 的 B 功能直接沿用文件名。"""
+    by_stem: dict[str, list[Path]] = {}
+    for pdf in registration_program.iter_pdfs(paths.confirmation_folder):
+        by_stem.setdefault(pdf.stem.casefold(), []).append(pdf)
+
+    documents: list[split_program.NamedDocument] = []
+    errors: list[str] = []
+    for name in names:
+        matches = by_stem.get(name.casefold(), [])
+        if len(matches) != 1:
+            detail = "未找到原 PDF" if not matches else "找到多个同名原 PDF"
+            errors.append(f"{name}：{detail}")
+            continue
+        source = matches[0]
+        page_count = merge_program.pdf_page_count(source)
+        if page_count % 2:
+            if merge_program.rendered_page_is_blank(source, page_count - 1):
+                page_count -= 1
+            else:
+                page_count += 1
+        documents.append(
+            split_program.NamedDocument(
+                filename=source.name,
+                page_count=page_count,
+            )
+        )
+    if errors:
+        raise RuntimeError(
+            "Pan 的 A 登记表与当前原始结算单不一致：\n  " + "\n  ".join(errors)
+        )
+    return documents
 
 
 def build_task_paths(
@@ -484,7 +529,7 @@ def choose_flow(value: str | None) -> str:
         return value
     print("\n请选择流程：")
     print("  A. 盖章前：precheck → registration → merge")
-    print("  B. 盖章后：split → scan")
+    print("  B. 盖章后：split → scan（Pan 直接沿用原文件名）")
     answer = input("输入 A 或 B：").strip().upper()
     if answer in {"A", "B"}:
         return answer
@@ -718,27 +763,46 @@ def run_after_flow(
     dry_run: bool,
     on_split_issue: str,
 ) -> str:
-    expected_count = registration_output_count(paths.registration_output)
+    registration_names = registration_output_names(paths.registration_output)
+    expected_count = len(registration_names)
+    source_named_documents = (
+        named_split_documents(paths, registration_names)
+        if paths.teacher in SOURCE_NAMED_TEACHERS
+        else None
+    )
     print(
         f"最后一次 A 输出校验基准：{paths.registration_output.name}，"
         f"共 {expected_count} 份"
     )
+    if source_named_documents is not None:
+        print("Pan 结算单将沿用 A 登记表中的原 PDF 名称和顺序，不做 OCR 重命名。")
 
     while True:
         try:
             def split_action() -> tuple[int, int]:
-                result = split_program.run_split(
-                    paths.scanned_folder,
-                    paths.split_output_folder,
-                    expected_count,
-                    preview=dry_run,
-                    scan_date=paths.scan_date,
-                    source_pdf=(
-                        paths.scan_source_pdf
-                        if paths.scan_source_is_override
-                        else None
-                    ),
+                source_pdf = (
+                    paths.scan_source_pdf
+                    if paths.scan_source_is_override
+                    else None
                 )
+                if source_named_documents is not None:
+                    result = split_program.run_named_split(
+                        paths.scanned_folder,
+                        paths.split_output_folder,
+                        source_named_documents,
+                        preview=dry_run,
+                        scan_date=paths.scan_date,
+                        source_pdf=source_pdf,
+                    )
+                else:
+                    result = split_program.run_split(
+                        paths.scanned_folder,
+                        paths.split_output_folder,
+                        expected_count,
+                        preview=dry_run,
+                        scan_date=paths.scan_date,
+                        source_pdf=source_pdf,
+                    )
                 if result[0] != expected_count:
                     raise RuntimeError(
                         f"split.py 返回 {result[0]} 份，预期 {expected_count} 份。"
@@ -795,8 +859,24 @@ def run_after_flow(
     if dry_run:
         print(f"计划 scan 目录：{paths.split_output_folder}")
         print(f"计划桌面压缩包：{paths.desktop_scan_zip_output}")
-        print("B 功能预览完成：dry-run 模式下不运行 scan.py 或生成 ZIP。")
+        if source_named_documents is not None:
+            print("B 功能预览完成：Pan 将跳过 scan.py，dry-run 未生成 PDF 或 ZIP。")
+        else:
+            print("B 功能预览完成：dry-run 模式下不运行 scan.py 或生成 ZIP。")
         return "dry_run"
+
+    if source_named_documents is not None:
+        print("Pan 拆分件已使用原文件名，跳过 scan.py OCR 识别和重命名。")
+
+        def package_action() -> tuple[int, int]:
+            create_desktop_zip(
+                paths.split_output_folder,
+                paths.desktop_scan_zip_output,
+            )
+            return split_count, 0
+
+        logger.run_step("zip（Pan 无需 scan.py 重命名）", package_action)
+        return "success"
 
     def scan_action() -> tuple[int, int]:
         result = scan_program.run_scan(paths.split_output_folder)
@@ -833,7 +913,7 @@ def parse_args() -> argparse.Namespace:
     flow_group.add_argument(
         "--flow",
         choices=("A", "B"),
-        help="A=盖章前流程，B=盖章后流程",
+        help="A=盖章前流程，B=盖章后流程（Pan 直接沿用原文件名）",
     )
     flow_group.add_argument(
         "--A",
@@ -847,7 +927,7 @@ def parse_args() -> argparse.Namespace:
         dest="flow",
         action="store_const",
         const="B",
-        help="运行 B 功能：split → scan",
+        help="运行 B 功能：split → scan；Pan 按原文件名拆分并跳过 scan",
     )
     parser.add_argument(
         "--on-issue",
@@ -939,7 +1019,8 @@ def main() -> int:
         print(f"\n本次处理人员：{teacher}")
         print(f"任务日期：{task_date:%Y-%m-%d}")
         print(f"任务批次：{batch:02d}")
-        print(f"确认书目录：{paths.confirmation_folder}")
+        document_label = "结算单" if teacher in SOURCE_NAMED_TEACHERS else "确认书"
+        print(f"{document_label}目录：{paths.confirmation_folder}")
         if flow == "A":
             status = run_before_flow(paths, logger, args.on_issue, args.dry_run)
         else:
