@@ -1,0 +1,343 @@
+{
+  "version": 1,
+  "mode": "ccbg",
+  "task_date": "2026-09-09",
+  "batch": 1,
+  "total_pages": 75,
+  "documents": [
+    {
+      "source_name": "持仓报告_20260803_20260831_云南友泽供应链管理有限公司.xlsx",
+      "source_sha256": "f1c8f181a61cb4becc3055877cecc16bb6dce0c233a5f7cdc7f1f058c24ca6b4",
+      "filename": "持仓报告_20260803_20260831_云南友泽供应链管理有限公司.pdf",
+      "company": "云南友泽供应链管理有限公司",
+      "customer_id": "HFSY-CW-0291",
+      "pages": 28,
+      "sheets": [
+        {
+          "name": "账户状况",
+          "area": "A1:L51",
+          "scale": 87,
+          "landscape": false,
+          "empty": false,
+          "start_page": 1,
+          "end_page": 2,
+          "pages": 2
+        },
+        {
+          "name": "持仓明细",
+          "area": "A1:AF98",
+          "scale": 21,
+          "landscape": false,
+          "empty": false,
+          "start_page": 3,
+          "end_page": 3,
+          "pages": 1
+        },
+        {
+          "name": "历史交易",
+          "area": "A1:X1449",
+          "scale": 29,
+          "landscape": true,
+          "empty": false,
+          "start_page": 4,
+          "end_page": 15,
+          "pages": 12
+        },
+        {
+          "name": "资金明细",
+          "area": "A1:E815",
+          "scale": 71,
+          "landscape": false,
+          "empty": false,
+          "start_page": 16,
+          "end_page": 28,
+          "pages": 13
+        }
+      ],
+      "skipped_sheets": [],
+      "pdf_sha256": "eab2f94d4b5c3da83ba47c26fb548533988e0b3c151973e7c7385ca4930fcf04"
+    },
+    {
+      "source_name": "持仓报告_20260803_20260831_云南汇通供应链服务有限公司.xlsx",
+      "source_sha256": "37770fbbd6aeed75a03c162a40cb799dc117e4aab36e20115f9f8117874c5c45",
+      "filename": "持仓报告_20260803_20260831_云南汇通供应链服务有限公司.pdf",
+      "company": "云南汇通供应链服务有限公司",
+      "customer_id": "HFSY-CW-0243",
+      "pages": 22,
+      "sheets": [
+        {
+          "name": "账户状况",
+          "area": "A1:L51",
+          "scale": 87,
+          "landscape": false,
+          "empty": false,
+          "start_page": 1,
+          "end_page": 2,
+          "pages": 2
+        },
+        {
+          "name": "持仓明细",
+          "area": "A1:AF30",
+          "scale": 21,
+          "landscape": false,
+          "empty": false,
+          "start_page": 3,
+          "end_page": 3,
+          "pages": 1
+        },
+        {
+          "name": "历史交易",
+          "area": "A1:X1052",
+          "scale": 29,
+          "landscape": true,
+          "empty": false,
+          "start_page": 4,
+          "end_page": 12,
+          "pages": 9
+        },
+        {
+          "name": "资金明细",
+          "area": "A1:E606",
+          "scale": 71,
+          "landscape": false,
+          "empty": false,
+          "start_page": 13,
+          "end_page": 22,
+          "pages": 10
+        }
+      ],
+      "skipped_sheets": [],
+      "pdf_sha256": "5df5f0576c4990dfe6c759ce59660dca8fff6d99c93c79edc87883151e1c74b8"
+    },
+    {
+      "source_name": "持仓报告_20260803_20260831_云南泛联商贸有限公司.xlsx",
+      "source_sha256": "7616eeb58963ed130f7d9e0b7ab304aff36006219b464a21f4644563358f8048",
+      "filename": "持仓报告_20260803_20260831_云南泛联商贸有限公司.pdf",
+      "company": "云南泛联商贸有限公司",
+      "customer_id": "HFSY-CW-0306",
+      "pages": 9,
+      "sheets": [
+        {
+          "name": "账户状况",
+          "area": "A1:L51",
+          "scale": 87,
+          "landscape": false,
+          "empty": false,
+          "start_page": 1,
+          "end_page": 2,
+          "pages": 2
+        },
+        {
+          "name": "持仓明细",
+          "area": "A1:AF15",
+          "scale": 21,
+          "landscape": false,
+          "empty": false,
+          "start_page": 3,
+          "end_page": 3,
+          "pages": 1
+        },
+        {
+          "name": "历史交易",
+          "area": "A1:X275",
+          "scale": 29,
+          "landscape": true,
+          "empty": false,
+          "start_page": 4,
+          "end_page": 6,
+          "pages": 3
+        },
+        {
+          "name": "资金明细",
+          "area": "A1:E171",
+          "scale": 71,
+          "landscape": false,
+          "empty": false,
+          "start_page": 7,
+          "end_page": 9,
+          "pages": 3
+        }
+      ],
+      "skipped_sheets": [],
+      "pdf_sha256": "09c68c62541fdf56a194af308a5e3ec1a641dc1eb9c610cf573a654708205043"
+    },
+    {
+      "source_name": "持仓报告_20260803_20260831_安徽钢多多国际贸易有限公司.xlsx",
+      "source_sha256": "641126069ea5b6b44094881bd3c52cafc548422d186f2d2863efd53e08c781db",
+      "filename": "持仓报告_20260803_20260831_安徽钢多多国际贸易有限公司.pdf",
+      "company": "安徽钢多多国际贸易有限公司",
+      "customer_id": "HFSY-CW-0341",
+      "pages": 4,
+      "sheets": [
+        {
+          "name": "账户状况",
+          "area": "A1:L51",
+          "scale": 87,
+          "landscape": false,
+          "empty": false,
+          "start_page": 1,
+          "end_page": 2,
+          "pages": 2
+        },
+        {
+          "name": "历史交易",
+          "area": "A1:X88",
+          "scale": 29,
+          "landscape": true,
+          "empty": false,
+          "start_page": 3,
+          "end_page": 3,
+          "pages": 1
+        },
+        {
+          "name": "资金明细",
+          "area": "A1:E54",
+          "scale": 71,
+          "landscape": false,
+          "empty": false,
+          "start_page": 4,
+          "end_page": 4,
+          "pages": 1
+        }
+      ],
+      "skipped_sheets": [
+        "持仓明细"
+      ],
+      "pdf_sha256": "37090ce5ee9ea7b90b54b7b811ec67b175b815522711823a831fc0175b060f1f"
+    },
+    {
+      "source_name": "持仓报告_20260803_20260831_江苏中恩国际贸易有限公司.xlsx",
+      "source_sha256": "523c110b3926fd6eb73f74421ea2c1223e332183cb1678f326c79b0898918605",
+      "filename": "持仓报告_20260803_20260831_江苏中恩国际贸易有限公司.pdf",
+      "company": "江苏中恩国际贸易有限公司",
+      "customer_id": "HFSY-CW-0318",
+      "pages": 4,
+      "sheets": [
+        {
+          "name": "账户状况",
+          "area": "A1:L51",
+          "scale": 87,
+          "landscape": false,
+          "empty": false,
+          "start_page": 1,
+          "end_page": 2,
+          "pages": 2
+        },
+        {
+          "name": "历史交易",
+          "area": "A1:X9",
+          "scale": 29,
+          "landscape": true,
+          "empty": false,
+          "start_page": 3,
+          "end_page": 3,
+          "pages": 1
+        },
+        {
+          "name": "资金明细",
+          "area": "A1:E6",
+          "scale": 71,
+          "landscape": false,
+          "empty": false,
+          "start_page": 4,
+          "end_page": 4,
+          "pages": 1
+        }
+      ],
+      "skipped_sheets": [
+        "持仓明细"
+      ],
+      "pdf_sha256": "8f4473c07f3168f05e5a72959a8da5ffe85d23594a80b7d0502022adf37ded0e"
+    },
+    {
+      "source_name": "持仓报告_20260803_20260831_江苏栋国进出口有限公司.xlsx",
+      "source_sha256": "141df58e6ca8b42b4472d9063ecbb29a4bb72aaef0b61f22ef1453e08b2cab16",
+      "filename": "持仓报告_20260803_20260831_江苏栋国进出口有限公司.pdf",
+      "company": "江苏栋国进出口有限公司",
+      "customer_id": "HFSY-CW-0313",
+      "pages": 4,
+      "sheets": [
+        {
+          "name": "账户状况",
+          "area": "A1:L51",
+          "scale": 87,
+          "landscape": false,
+          "empty": false,
+          "start_page": 1,
+          "end_page": 2,
+          "pages": 2
+        },
+        {
+          "name": "历史交易",
+          "area": "A1:X10",
+          "scale": 29,
+          "landscape": true,
+          "empty": false,
+          "start_page": 3,
+          "end_page": 3,
+          "pages": 1
+        },
+        {
+          "name": "资金明细",
+          "area": "A1:E7",
+          "scale": 71,
+          "landscape": false,
+          "empty": false,
+          "start_page": 4,
+          "end_page": 4,
+          "pages": 1
+        }
+      ],
+      "skipped_sheets": [
+        "持仓明细"
+      ],
+      "pdf_sha256": "4bdc46c48de6af42e98b10ae7457e47a48350be575c032d893a819219496494c"
+    },
+    {
+      "source_name": "持仓报告_20260803_20260831_江苏聚棉电子商务有限公司.xlsx",
+      "source_sha256": "efca4c47ffa109f92689ad5ba9ccb0d220b4244114b1ffc9817314d7a69718c8",
+      "filename": "持仓报告_20260803_20260831_江苏聚棉电子商务有限公司.pdf",
+      "company": "江苏聚棉电子商务有限公司",
+      "customer_id": "HFSY-CW-0300",
+      "pages": 4,
+      "sheets": [
+        {
+          "name": "账户状况",
+          "area": "A1:L51",
+          "scale": 87,
+          "landscape": false,
+          "empty": false,
+          "start_page": 1,
+          "end_page": 2,
+          "pages": 2
+        },
+        {
+          "name": "历史交易",
+          "area": "A1:X10",
+          "scale": 29,
+          "landscape": true,
+          "empty": false,
+          "start_page": 3,
+          "end_page": 3,
+          "pages": 1
+        },
+        {
+          "name": "资金明细",
+          "area": "A1:E7",
+          "scale": 71,
+          "landscape": false,
+          "empty": false,
+          "start_page": 4,
+          "end_page": 4,
+          "pages": 1
+        }
+      ],
+      "skipped_sheets": [
+        "持仓明细"
+      ],
+      "pdf_sha256": "d2aa1fa2431dd57b48be9a7e53504f801bbc6186ae2d58313f33d8f7bc7ee341"
+    }
+  ],
+  "merged_sha256": "d4c1caddf4c2f95b7e72a1d7119127dd1502fa79ea6f676c43c34bc73e097278",
+  "registration_sha256": "5d6b4383d69e0e01ac4d7e4b5f99858d02577eaf19960e63b13bb276922eb068"
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""按人员运行确认书；Pan 可选 jsd 结算单/确认书或 ccbg 持仓报告。"""
+"""按人员统一运行确认书或 Pan 结算单处理流程。"""
 
 from __future__ import annotations
 
@@ -31,7 +31,6 @@ import precheck as precheck_program  # noqa: E402
 import registration as registration_program  # noqa: E402
 import scan as scan_program  # noqa: E402
 import split as split_program  # noqa: E402
-import holdings as holdings_program  # noqa: E402
 
 
 T = TypeVar("T")
@@ -58,11 +57,6 @@ class TaskPaths:
     desktop_merged_pdf_output: Path
     desktop_scan_zip_output: Path
     log_path: Path
-    mode: str = "jsd"
-
-    @property
-    def holdings_pdf_folder(self) -> Path:
-        return self.teacher_folder / "持仓报告" / f"持仓PDF单独_{self.task_date:%Y%m%d}_{self.batch:02d}"
 
 
 def windows_desktop_folder() -> Path:
@@ -90,15 +84,12 @@ def output_paths(
     teacher: str,
     task_date: date,
     batch: int,
-    mode: str = "jsd",
 ) -> tuple[Path, Path, Path, Path]:
     teacher_folder = PROJECT_ROOT / teacher
     date_text = task_date.strftime("%Y%m%d")
     batch_text = f"{batch:02d}"
-    registration_prefix = "登记表_持仓报告" if mode == "ccbg" else "登记表"
-    registration_name = f"{registration_prefix}_{teacher}_{date_text}_{batch_text}.xls"
-    merged_prefix = "持仓报告合并" if mode == "ccbg" else "确认书合并"
-    merged_pdf_name = f"{merged_prefix}_{teacher}_{date_text}_{batch_text}.pdf"
+    registration_name = f"登记表_{teacher}_{date_text}_{batch_text}.xls"
+    merged_pdf_name = f"确认书合并_{teacher}_{date_text}_{batch_text}.pdf"
     desktop = windows_desktop_folder()
     return (
         teacher_folder / "登记表文件" / registration_name,
@@ -108,33 +99,27 @@ def output_paths(
     )
 
 
-def used_batches(teacher: str, task_date: date, mode: str = "jsd") -> set[int]:
+def used_batches(teacher: str, task_date: date) -> set[int]:
     """从两类正式输出中提取已经出现过的批次。"""
     teacher_folder = PROJECT_ROOT / teacher
     date_text = task_date.strftime("%Y%m%d")
-    registration_prefix = "登记表_持仓报告" if mode == "ccbg" else "登记表"
-    merged_prefix = "持仓报告合并" if mode == "ccbg" else "确认书合并"
     patterns = (
         (
             teacher_folder / "登记表文件",
             re.compile(
-                rf"^{registration_prefix}_{re.escape(teacher)}_{date_text}_(\d+)\.xls$",
+                rf"^登记表_{re.escape(teacher)}_{date_text}_(\d+)\.xls$",
                 flags=re.IGNORECASE,
             ),
         ),
         (
             teacher_folder / "合并PDF",
             re.compile(
-                rf"^{merged_prefix}_{re.escape(teacher)}_{date_text}_(\d+)\.pdf$",
+                rf"^确认书合并_{re.escape(teacher)}_{date_text}_(\d+)\.pdf$",
                 flags=re.IGNORECASE,
             ),
         ),
     )
     batches: set[int] = set()
-    if mode == "ccbg":
-        for path in (teacher_folder / "持仓报告").glob(f"持仓PDF单独_{date_text}_*"):
-            if path.is_dir() and path.name.rsplit("_", 1)[-1].isdigit():
-                batches.add(int(path.name.rsplit("_", 1)[-1]))
     for folder, pattern in patterns:
         if not folder.is_dir():
             continue
@@ -145,37 +130,32 @@ def used_batches(teacher: str, task_date: date, mode: str = "jsd") -> set[int]:
     return batches
 
 
-def choose_a_batch(teacher: str, task_date: date, mode: str = "jsd") -> int:
+def choose_a_batch(teacher: str, task_date: date) -> int:
     """优先续跑未完成批次，否则返回下一个新批次。"""
-    batches = used_batches(teacher, task_date, mode)
-    if mode == "ccbg":
-        return max(batches, default=0) + 1
+    batches = used_batches(teacher, task_date)
     for batch in sorted(batches):
         if not batch_outputs_complete(teacher, task_date, batch):
             return batch
     return max(batches, default=0) + 1
 
 
-def batch_outputs_complete(teacher: str, task_date: date, batch: int, mode: str = "jsd") -> bool:
+def batch_outputs_complete(teacher: str, task_date: date, batch: int) -> bool:
     """以人员目录中的两份正式输出判断 A 功能是否完成。"""
     registration_output, merged_pdf_output, _, _ = output_paths(
-        teacher, task_date, batch, mode
+        teacher, task_date, batch
     )
-    if mode == "ccbg":
-        folder = PROJECT_ROOT / teacher / "持仓报告" / f"持仓PDF单独_{task_date:%Y%m%d}_{batch:02d}"
-        return holdings_program.batch_complete(folder, registration_output, merged_pdf_output)
     return registration_output.is_file() and merged_pdf_output.is_file()
 
 
-def completed_batches(teacher: str, task_date: date, mode: str = "jsd") -> set[int]:
+def completed_batches(teacher: str, task_date: date) -> set[int]:
     completed: set[int] = set()
-    for batch in used_batches(teacher, task_date, mode):
-        if batch_outputs_complete(teacher, task_date, batch, mode):
+    for batch in used_batches(teacher, task_date):
+        if batch_outputs_complete(teacher, task_date, batch):
             completed.add(batch)
     return completed
 
 
-def latest_completed_batch(teacher: str, mode: str = "jsd") -> tuple[date, int] | None:
+def latest_completed_batch(teacher: str) -> tuple[date, int] | None:
     """按运行顺序查找该老师最后一次成功完成的 A 批次。"""
     log_path = PROJECT_ROOT / teacher / "运行记录.json"
     if log_path.is_file():
@@ -189,8 +169,6 @@ def latest_completed_batch(teacher: str, mode: str = "jsd") -> tuple[date, int] 
                     continue
                 if record.get("flow") != "A" or record.get("status") != "success":
                     continue
-                if record.get("mode", "jsd") != mode:
-                    continue
                 try:
                     task_date = datetime.strptime(
                         str(record["task_date"]), "%Y-%m-%d"
@@ -198,15 +176,14 @@ def latest_completed_batch(teacher: str, mode: str = "jsd") -> tuple[date, int] 
                     batch = int(record["batch"])
                 except (KeyError, TypeError, ValueError):
                     continue
-                if batch_outputs_complete(teacher, task_date, batch, mode):
+                if batch_outputs_complete(teacher, task_date, batch):
                     return task_date, batch
 
     # 兼容没有运行记录的旧输出：按两份成品中较新的修改时间选择。
     candidates: list[tuple[float, date, int]] = []
     registration_folder = PROJECT_ROOT / teacher / "登记表文件"
-    registration_prefix = "登记表_持仓报告" if mode == "ccbg" else "登记表"
     pattern = re.compile(
-        rf"^{registration_prefix}_{re.escape(teacher)}_(\d{{8}})_(\d+)\.xls$",
+        rf"^登记表_{re.escape(teacher)}_(\d{{8}})_(\d+)\.xls$",
         flags=re.IGNORECASE,
     )
     if registration_folder.is_dir():
@@ -216,8 +193,8 @@ def latest_completed_batch(teacher: str, mode: str = "jsd") -> tuple[date, int] 
                 continue
             task_date = datetime.strptime(match.group(1), "%Y%m%d").date()
             batch = int(match.group(2))
-            if batch_outputs_complete(teacher, task_date, batch, mode):
-                registration, merged, _, _ = output_paths(teacher, task_date, batch, mode)
+            if batch_outputs_complete(teacher, task_date, batch):
+                registration, merged, _, _ = output_paths(teacher, task_date, batch)
                 candidates.append(
                     (max(registration.stat().st_mtime, merged.stat().st_mtime), task_date, batch)
                 )
@@ -300,19 +277,14 @@ def build_task_paths(
     batch: int,
     scan_date: date | None = None,
     scan_source: Path | None = None,
-    mode: str = "jsd",
 ) -> TaskPaths:
-    if mode not in {"jsd", "ccbg"} or (mode == "ccbg" and teacher != "Pan"):
-        raise RuntimeError("ccbg 持仓报告仅适用于 Pan。")
     if batch < 1:
         raise RuntimeError("批次必须是大于 0 的整数。")
     teacher_folder = PROJECT_ROOT / teacher
-    confirmation_folder = teacher_folder / ("持仓报告" if mode == "ccbg" else "确认书文件")
+    confirmation_folder = teacher_folder / "确认书文件"
     registration_folder = teacher_folder / "登记表文件"
     merged_pdf_folder = teacher_folder / "合并PDF"
-    scanned_folder = teacher_folder / ("持仓报告扫描" if mode == "ccbg" else "确认书扫描")
-    if mode == "ccbg" and teacher_folder.is_dir():
-        scanned_folder.mkdir(exist_ok=True)
+    scanned_folder = teacher_folder / "确认书扫描"
     template_path = PROJECT_ROOT / "登记表模版.xls"
     desktop_folder = windows_desktop_folder()
     effective_scan_date = scan_date or date.today()
@@ -325,8 +297,6 @@ def build_task_paths(
     split_folder_name = (
         f"扫描件_{effective_scan_date:%m%d}_{teacher}_{batch:02d}"
     )
-    if mode == "ccbg":
-        split_folder_name = f"持仓扫描件_{effective_scan_date:%Y%m%d}_{teacher}_{task_date:%Y%m%d}_{batch:02d}"
 
     required = [
         (teacher_folder, "人员目录"),
@@ -346,7 +316,7 @@ def build_task_paths(
         merged_pdf_output,
         desktop_registration_output,
         desktop_merged_pdf_output,
-    ) = output_paths(teacher, task_date, batch, mode)
+    ) = output_paths(teacher, task_date, batch)
     return TaskPaths(
         teacher=teacher,
         task_date=task_date,
@@ -367,7 +337,6 @@ def build_task_paths(
         desktop_merged_pdf_output=desktop_merged_pdf_output,
         desktop_scan_zip_output=desktop_folder / f"{split_folder_name}.zip",
         log_path=teacher_folder / "运行记录.json",
-        mode=mode,
     )
 
 
@@ -422,7 +391,6 @@ class RunLogger:
             "run_id": self.run_id,
             "teacher": self.paths.teacher,
             "flow": self.flow,
-            "mode": self.paths.mode,
             "task_date": self.paths.task_date.isoformat(),
             "scan_date": self.paths.scan_date.isoformat(),
             "batch": f"{self.paths.batch:02d}",
@@ -556,32 +524,12 @@ def choose_teacher(value: str | None) -> str:
     return choose_teacher(answer)
 
 
-def choose_mode(teacher: str, value: str | None) -> str:
-    if teacher != "Pan":
-        if value == "ccbg":
-            raise RuntimeError("ccbg 持仓报告仅适用于 Pan。")
-        return "jsd"
-    if value is not None:
-        return value
-    print("\n请选择 Pan 的业务：")
-    print("  jsd. 结算单 / 确认书（原流程）")
-    print("  ccbg. 持仓报告")
-    answer = input("输入 jsd 或 ccbg：").strip().casefold()
-    if answer not in {"jsd", "ccbg"}:
-        raise RuntimeError(f"无效业务选项：{answer}；命令行可用 --mode jsd 或 --mode ccbg。")
-    return answer
-
-
-def choose_flow(value: str | None, mode: str = "jsd") -> str:
+def choose_flow(value: str | None) -> str:
     if value is not None:
         return value
     print("\n请选择流程：")
-    if mode == "ccbg":
-        print("  A. 盖章前：表格原名登记 → 指定 sheet 转 PDF → 合并")
-        print("  B. 盖章后：OCR 识别账户首页和资金末页 → 原名拆分")
-    else:
-        print("  A. 盖章前：precheck → registration → merge")
-        print("  B. 盖章后：split → scan（Pan 直接沿用原文件名）")
+    print("  A. 盖章前：precheck → registration → merge")
+    print("  B. 盖章后：split → scan（Pan 直接沿用原文件名）")
     answer = input("输入 A 或 B：").strip().upper()
     if answer in {"A", "B"}:
         return answer
@@ -694,8 +642,6 @@ def safe_clear_split_output(paths: TaskPaths) -> None:
     target = paths.split_output_folder.resolve()
     parent = paths.scanned_folder.resolve()
     expected_name = f"扫描件_{paths.scan_date:%m%d}_{paths.teacher}_{paths.batch:02d}"
-    if paths.mode == "ccbg":
-        expected_name = f"持仓扫描件_{paths.scan_date:%Y%m%d}_{paths.teacher}_{paths.task_date:%Y%m%d}_{paths.batch:02d}"
     if target.parent != parent or target.name != expected_name:
         raise RuntimeError(f"拒绝清理未通过路径校验的目录：{target}")
     if target.is_symlink():
@@ -742,15 +688,6 @@ def run_before_flow(
     on_issue: str,
     dry_run: bool,
 ) -> str:
-    if paths.mode == "ccbg":
-        logger.run_step("持仓表格登记与 PDF 合并", lambda: holdings_program.run_before(paths, dry_run))
-        if dry_run:
-            print(f"计划桌面副本：{paths.desktop_registration_output}")
-            print(f"计划桌面副本：{paths.desktop_merged_pdf_output}")
-        else:
-            copy_output(paths.registration_output, paths.desktop_registration_output)
-            copy_output(paths.merged_pdf_output, paths.desktop_merged_pdf_output)
-        return "dry_run" if dry_run else "success"
     attempt = 1
     while True:
         def precheck_action() -> int:
@@ -827,24 +764,6 @@ def run_after_flow(
     on_split_issue: str,
 ) -> str:
     registration_names = registration_output_names(paths.registration_output)
-    if paths.mode == "ccbg":
-        while True:
-            try:
-                logger.run_step("持仓扫描件 OCR 拆分", lambda: holdings_program.run_after(paths, registration_names, dry_run))
-                break
-            except (OSError, RuntimeError, ValueError) as exc:
-                print(f"\n持仓拆分异常：{exc}", file=sys.stderr)
-                action = split_issue_action(on_split_issue)
-                if action == "resplit" and not dry_run:
-                    safe_clear_split_output(paths)
-                    continue
-                print("持仓拆分已停止；须通过全部账户、末页和页数校验才能打包。")
-                return "stopped"
-        if dry_run:
-            print(f"计划桌面压缩包：{paths.desktop_scan_zip_output}")
-            return "dry_run"
-        logger.run_step("持仓扫描件 ZIP", lambda: create_desktop_zip(paths.split_output_folder, paths.desktop_scan_zip_output))
-        return "success"
     expected_count = len(registration_names)
     source_named_documents = (
         named_split_documents(paths, registration_names)
@@ -990,8 +909,6 @@ def parse_args() -> argparse.Namespace:
             help=f"选择 {teacher} 老师",
         )
 
-    parser.add_argument("--mode", type=str.lower, choices=("jsd", "ccbg"),
-                        help="Pan 业务：jsd=原结算单/确认书，ccbg=持仓报告；省略时询问")
     flow_group = parser.add_mutually_exclusive_group()
     flow_group.add_argument(
         "--flow",
@@ -1003,14 +920,14 @@ def parse_args() -> argparse.Namespace:
         dest="flow",
         action="store_const",
         const="A",
-        help="运行 A 功能：按选定业务生成登记表和合并 PDF",
+        help="运行 A 功能：precheck → registration → merge",
     )
     flow_group.add_argument(
         "--B",
         dest="flow",
         action="store_const",
         const="B",
-        help="运行 B 功能：扫描拆分；ccbg 识别账户/资金边界，Pan 保留原文件名",
+        help="运行 B 功能：split → scan；Pan 按原文件名拆分并跳过 scan",
     )
     parser.add_argument(
         "--on-issue",
@@ -1055,8 +972,7 @@ def main() -> int:
     status = "failed"
     try:
         teacher = choose_teacher(args.teacher)
-        mode = choose_mode(teacher, args.mode)
-        flow = choose_flow(args.flow, mode)
+        flow = choose_flow(args.flow)
         if flow == "A" and args.scan_source is not None:
             raise RuntimeError("--scan-source 只能用于 B 功能。")
         if args.batch is not None and args.batch < 1:
@@ -1064,11 +980,11 @@ def main() -> int:
 
         if flow == "A":
             task_date = args.task_date or date.today()
-            batch = args.batch or choose_a_batch(teacher, task_date, mode)
+            batch = args.batch or choose_a_batch(teacher, task_date)
         else:
             if args.task_date is not None or args.batch is not None:
                 task_date = args.task_date or date.today()
-                available = completed_batches(teacher, task_date, mode)
+                available = completed_batches(teacher, task_date)
                 if args.batch is not None:
                     batch = args.batch
                     if batch not in available:
@@ -1083,7 +999,7 @@ def main() -> int:
                         )
                     batch = max(available)
             else:
-                latest = latest_completed_batch(teacher, mode)
+                latest = latest_completed_batch(teacher)
                 if latest is None:
                     raise RuntimeError(
                         f"没有找到 {teacher} 已完成的 A 功能批次，无法确定 B 功能批次。"
@@ -1097,18 +1013,13 @@ def main() -> int:
             batch,
             scan_date=scan_date,
             scan_source=args.scan_source,
-            mode=mode,
         )
         logger = RunLogger(paths, flow)
 
         print(f"\n本次处理人员：{teacher}")
-        if teacher == "Pan":
-            print(f"业务路径：{mode}")
         print(f"任务日期：{task_date:%Y-%m-%d}")
         print(f"任务批次：{batch:02d}")
         document_label = "结算单" if teacher in SOURCE_NAMED_TEACHERS else "确认书"
-        if mode == "ccbg":
-            document_label = "持仓报告"
         print(f"{document_label}目录：{paths.confirmation_folder}")
         if flow == "A":
             status = run_before_flow(paths, logger, args.on_issue, args.dry_run)
@@ -1121,7 +1032,7 @@ def main() -> int:
                 args.dry_run,
                 args.on_split_issue,
             )
-        return 1 if mode == "ccbg" and status == "stopped" else 0
+        return 0
     except KeyboardInterrupt:
         status = "interrupted"
         print("\n操作已由用户中断。", file=sys.stderr)

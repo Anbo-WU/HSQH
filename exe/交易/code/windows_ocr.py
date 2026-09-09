@@ -81,7 +81,11 @@ def _recognize_crop(
     return lines
 
 
-def recognize_split_pages(source: Path) -> list[tuple[OCRLine, ...]]:
+def recognize_split_pages(
+    source: Path,
+    *,
+    regions: tuple[tuple[float, float], ...] = ((0.0, 0.5), (0.6, 1.0)),
+) -> list[tuple[OCRLine, ...]]:
     """OCR the top and bottom regions needed to determine document boundaries."""
     engine = create_engine()
     try:
@@ -95,24 +99,13 @@ def recognize_split_pages(source: Path) -> list[tuple[OCRLine, ...]]:
         for page_index in range(document.page_count):
             image = _render_page(document[page_index])
             height, width = image.shape[:2]
-            top_end = max(1, round(height * 0.50))
-            bottom_start = min(height - 1, round(height * 0.60))
-            lines = _recognize_crop(
-                engine,
-                image[:top_end],
-                width,
-                height,
-                0,
-            )
-            lines.extend(
-                _recognize_crop(
-                    engine,
-                    image[bottom_start:],
-                    width,
-                    height,
-                    bottom_start,
+            lines: list[OCRLine] = []
+            for start, end in regions:
+                first = max(0, min(height - 1, round(height * start)))
+                last = max(first + 1, min(height, round(height * end)))
+                lines.extend(
+                    _recognize_crop(engine, image[first:last], width, height, first)
                 )
-            )
             recognized.append(tuple(lines))
             page_number = page_index + 1
             if page_number == 1 or page_number % 5 == 0 or page_number == document.page_count:

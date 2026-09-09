@@ -410,6 +410,8 @@ def print_plans(
         verification = (
             "原文件页数已匹配"
             if plan.kind == "按 A 原文件名拆分"
+            else "账户首页/资金末页已核对"
+            if plan.kind == "持仓报告账户首页/资金末页"
             else f"末页盖章OCR={'已确认' if plan.footer_confirmed else '未识别'}"
         )
         print(

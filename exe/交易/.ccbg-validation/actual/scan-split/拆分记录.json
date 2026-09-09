@@ -1,0 +1,75 @@
+{
+  "source_name": "full-scan.pdf",
+  "source_size": 17107806,
+  "source_sha256": "f7c8403d9cf1d8f94a0c9c5e8b537efcd2224ca14079bd898fc8fe7124459473",
+  "expected_count": 7,
+  "generated_count": 7,
+  "status": "complete",
+  "total_pages": 75,
+  "documents": [
+    {
+      "number": 1,
+      "start_page": 1,
+      "end_page": 28,
+      "kind": "持仓报告账户首页/资金末页",
+      "transaction_number": "持仓报告_20260803_20260831_云南友泽供应链管理有限公司",
+      "filename": "持仓报告_20260803_20260831_云南友泽供应链管理有限公司.pdf",
+      "footer_confirmed": true
+    },
+    {
+      "number": 2,
+      "start_page": 29,
+      "end_page": 50,
+      "kind": "持仓报告账户首页/资金末页",
+      "transaction_number": "持仓报告_20260803_20260831_云南汇通供应链服务有限公司",
+      "filename": "持仓报告_20260803_20260831_云南汇通供应链服务有限公司.pdf",
+      "footer_confirmed": true
+    },
+    {
+      "number": 3,
+      "start_page": 51,
+      "end_page": 59,
+      "kind": "持仓报告账户首页/资金末页",
+      "transaction_number": "持仓报告_20260803_20260831_云南泛联商贸有限公司",
+      "filename": "持仓报告_20260803_20260831_云南泛联商贸有限公司.pdf",
+      "footer_confirmed": true
+    },
+    {
+      "number": 4,
+      "start_page": 60,
+      "end_page": 63,
+      "kind": "持仓报告账户首页/资金末页",
+      "transaction_number": "持仓报告_20260803_20260831_安徽钢多多国际贸易有限公司",
+      "filename": "持仓报告_20260803_20260831_安徽钢多多国际贸易有限公司.pdf",
+      "footer_confirmed": true
+    },
+    {
+      "number": 5,
+      "start_page": 64,
+      "end_page": 67,
+      "kind": "持仓报告账户首页/资金末页",
+      "transaction_number": "持仓报告_20260803_20260831_江苏中恩国际贸易有限公司",
+      "filename": "持仓报告_20260803_20260831_江苏中恩国际贸易有限公司.pdf",
+      "footer_confirmed": true
+    },
+    {
+      "number": 6,
+      "start_page": 68,
+      "end_page": 71,
+      "kind": "持仓报告账户首页/资金末页",
+      "transaction_number": "持仓报告_20260803_20260831_江苏栋国进出口有限公司",
+      "filename": "持仓报告_20260803_20260831_江苏栋国进出口有限公司.pdf",
+      "footer_confirmed": true
+    },
+    {
+      "number": 7,
+      "start_page": 72,
+      "end_page": 75,
+      "kind": "持仓报告账户首页/资金末页",
+      "transaction_number": "持仓报告_20260803_20260831_江苏聚棉电子商务有限公司",
+      "filename": "持仓报告_20260803_20260831_江苏聚棉电子商务有限公司.pdf",
+      "footer_confirmed": true
+    }
+  ],
+  "issues": []
+}
