@@ -1,0 +1,6 @@
+# account only; validated with Windows x64 / Python 3.12.
+openpyxl==3.1.5
+PyMuPDF==1.28.2
+rapidocr==3.9.2
+onnxruntime==1.29.0
+numpy==2.5.2
