@@ -2,6 +2,7 @@
 from contextlib import redirect_stdout
 from copy import deepcopy
 from decimal import Decimal
+from datetime import datetime
 import importlib
 import io
 from pathlib import Path
@@ -29,6 +30,23 @@ def tables():
 
 
 class RulesTest(unittest.TestCase):
+    def test_location_and_insurance_period(self):
+        for address, expected in (
+            ('山东省烟台市牟平区姜格庄街道北松', '山东省烟台市牟平区'),
+            ('山东省烟台市海阳县某村', '山东省烟台市海阳县'),
+            ('广西壮族自治区南宁市武鸣区某镇', '广西壮族自治区南宁市武鸣区'),
+        ):
+            self.assertEqual(p.district_location('标的地点及方位：\n地点：' + address), expected)
+        self.assertEqual(p.coverage_dates('保险期间：自2026年08月28日23:00零时起，至 2027年01月28日二十四时止。'),
+                         (datetime(2026, 8, 28), datetime(2027, 1, 28)))
+        for text in ('保险期间：自2026年02月30日起，至2027年01月28日止',
+                     '保险期间：自2027年01月28日起，至2026年08月28日止',
+                     '保险期间：自2026年08月28日起'):
+            with self.assertRaises(p.RecognitionError):
+                p.coverage_dates(text)
+        with self.assertRaises(p.RecognitionError):
+            p.district_location('标的地点及方位：地点：山东省烟台市 条款名称：某保险')
+
     def test_identifiers(self):
         for kind in ('JY', 'FWJY', 'AB', 'ABCD'):
             tid = f'【HFSY】0147-{kind}-2026082705'
@@ -101,10 +119,12 @@ class RulesTest(unittest.TestCase):
             ws['AN5'] = '【HFSY】0147-JY-2026082705'
             ws['AN6'] = '【HFSY】0147-JY-2026082706'
             ws['A5'], ws['BA6'], ws['AU5'] = '=1+2', 777, '旧公司名'
+            ws['M5'] = 'M列保留'
             wb.save(source)
             original = source.read_bytes()
             values = {**p.table_values(tables()), 'AQ': 2, 'AT': 0, 'AU': None,
-                      'BS': Decimal(0), 'BY': Decimal(0), 'BZ': '无'}
+                      'BS': Decimal(0), 'BY': Decimal(0), 'BZ': '无',
+                      'K': '山东省烟台市牟平区', 'N': datetime(2026, 8, 28), 'O': datetime(2027, 1, 28)}
             record = {'id': ws['AN5'].value, 'path': str(folder / 'one.pdf'), 'method': 'test',
                       'values': values, 'warnings': []}
             with patch.object(p.Reader, 'extract', return_value=record), redirect_stdout(io.StringIO()):
@@ -117,6 +137,12 @@ class RulesTest(unittest.TestCase):
             self.assertEqual(result['BA6'].value, 777)
             self.assertEqual(result['BE5'].value, 0.1)
             self.assertEqual(result['BE5'].number_format, '0.0000%')
+            self.assertEqual(result['K5'].value, '山东省烟台市牟平区')
+            self.assertEqual(result['M5'].value, 'M列保留')
+            self.assertEqual(result['N5'].value, datetime(2026, 8, 28))
+            self.assertEqual(result['O5'].value, datetime(2027, 1, 28))
+            self.assertEqual(result['N5'].number_format, 'yyyy-mm-dd')
+            self.assertEqual(result['O5'].number_format, 'yyyy-mm-dd')
             self.assertEqual(source.read_bytes(), original)
             with self.assertRaises(FileExistsError):
                 p.run(source, folder, source)
@@ -140,6 +166,11 @@ class RealPolicyTest(unittest.TestCase):
         for pdf in PDFS:
             with self.subTest(pdf=pdf.name):
                 record = reader.extract(pdf)
+                self.assertEqual(record['values']['K'], '山东省烟台市牟平区')
+                self.assertEqual(record['values']['N'], datetime(2026, 8, 28))
+                end = {'197': datetime(2027, 1, 28), '198': datetime(2027, 1, 28),
+                       '199': datetime(2026, 12, 28)}.get(pdf.stem[-3:], datetime(2027, 2, 28))
+                self.assertEqual(record['values']['O'], end)
                 suffix, amount, premium, rate = expected[pdf.stem[-3:]]
                 self.assertTrue(record['id'].endswith('20260827' + suffix))
                 for col, value in zip(('BA', 'BD', 'BE'), (amount, premium, rate)):

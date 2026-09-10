@@ -18,7 +18,7 @@ import pymupdf
 
 BASE = Path(__file__).resolve().parent
 CENT = Decimal('0.01')
-TARGETS = 'AQ AT AU BA BD BE BR BS BT BU BV BW BX BY BZ'.split()
+TARGETS = 'K N O AQ AT AU BA BD BE BR BS BT BU BV BW BX BY BZ'.split()
 FUNDING = {
     'BR': ('其他',),
     'BT': ('中央财政', '中央财政补贴'),
@@ -155,6 +155,55 @@ def body_identifier(spans: list[Span]) -> str:
 
 def clean_header(value: object) -> str:
     return re.sub(r'\((?:元|%)\)', '', compact(value))
+
+
+def district_location(text: str) -> str:
+    text = compact(text)
+    match = re.search(r'标的地点及方位[:：]?地点[:：]([^:：;；]+)', text)
+    if not match:
+        raise RecognitionError('未找到标的地点及方位下的“地点：”')
+    address = re.split(r'条款名称|保险期间|方位[:：]', match[1])[0]
+    for ending in re.finditer(r'[区县]', address):
+        location = address[:ending.end()]
+        if location.endswith('自治区'):
+            continue
+        if re.fullmatch(r'[\u4e00-\u9fff·]+', location):
+            return location
+    raise RecognitionError('标的地点未识别到明确的区/县')
+
+
+def coverage_dates(text: str) -> tuple[datetime, datetime]:
+    text = compact(text)
+    date_part = r'(\d{4}年\d{1,2}月\d{1,2}日)'
+    matches = list(re.finditer(r'保险期间[:：]自' + date_part + r'[^至]*至' + date_part, text))
+    if len(matches) != 1:
+        raise RecognitionError('未找到唯一完整的保险期间起止日期')
+    try:
+        start, end = (datetime.strptime(value, '%Y年%m月%d日') for value in matches[0].groups())
+    except ValueError as exc:
+        raise RecognitionError('保险期间包含无效日期') from exc
+    if end < start:
+        raise RecognitionError('保险到期日早于起始日')
+    return start, end
+
+
+def policy_details(spans: list[Span]) -> dict:
+    location_y = anchor_y(spans, '标的地点及方位')
+    period_y = anchor_y(spans, '保险期间')
+    end_y = anchor_y(spans, '特别约定')
+    location_spans = [s for s in spans if location_y <= s.cy < period_y]
+    period_spans = [s for s in spans if period_y <= s.cy < end_y]
+    # 新字段的 OCR 低置信度也沿用整行转人工核对规则。
+    location_rows = reading_rows(location_spans)
+    relevant_location = []
+    for row in location_rows:
+        if '条款名称' in compact(''.join(s.text for s in row)):
+            break
+        relevant_location.extend(row)
+    if any(s.score < 0.85 for s in relevant_location + period_spans):
+        raise RecognitionError('标的地点或保险期间 OCR 置信度不足')
+    start, end = coverage_dates(region_text(period_spans))
+    return {'K': district_location(region_text(relevant_location)), 'N': start, 'O': end}
 
 
 def table_values(tables: list[list[list[str | None]]]) -> dict[str, Decimal]:
@@ -300,6 +349,7 @@ class Reader:
             raise RecognitionError(f'文件名与特别约定编号不一致：{file_ids} / {transaction_id}')
         farmers, companies, names = insured(spans)
         values = table_values(tables)
+        values.update(policy_details(spans))
         values.update({'AQ': farmers, 'AT': companies, 'AU': names or None,
                        'BS': Decimal(0), 'BY': Decimal(0), 'BZ': '无'})
         warnings = [f'异常：同一保单有 {companies} 家公司：{names}'] if companies > 1 else []
@@ -374,7 +424,10 @@ def run(source: Path, folder: Path, output: Path | None, *, sheet: str | None = 
             for col, value in record['values'].items():
                 cell = ws[f'{col}{row}']
                 cell.value = float(value) if isinstance(value, Decimal) else value
-                cell.number_format = '0.0000%' if col == 'BE' else ('0' if col in ('AQ', 'AT') else ('General' if col in ('AU', 'BZ') else '#,##0.00'))
+                cell.number_format = ('yyyy-mm-dd' if col in ('N', 'O') else
+                                      '0.0000%' if col == 'BE' else
+                                      '0' if col in ('AQ', 'AT') else
+                                      'General' if col in ('K', 'AU', 'BZ') else '#,##0.00')
             success += 1
             item.update({'状态': '已填充' if output else '预览通过', 'PDF': record['path'], '识别方式': record['method'],
                          '说明': '；'.join(record['warnings']), **record['values']})
@@ -401,7 +454,8 @@ def run(source: Path, folder: Path, output: Path | None, *, sheet: str | None = 
         with output.with_suffix('.csv').open('x', encoding='utf-8-sig', newline='') as handle:
             writer = csv.DictWriter(handle, fieldnames=fields)
             writer.writeheader()
-            writer.writerows(report)
+            writer.writerows({key: value.strftime('%Y-%m-%d') if isinstance(value, datetime) else value
+                              for key, value in item.items()} for item in report)
         print(f'新表：{output}\n核对记录：{output.with_suffix(".csv")}', flush=True)
     book.close()
     skipped = len(jobs) - success
