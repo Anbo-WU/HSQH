@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import os
 import re
 import shutil
@@ -47,88 +46,6 @@ ANSWER_RE = re.compile(
 NAME_RE = re.compile(
     r"交易者名称\s*[:：]\s*(.*?)\s*证件号\s*[:：]", re.DOTALL
 )
-
-# macOS 上通过 PDFKit 读取文本型 PDF；如果某页没有文本层，则使用 Vision
-# 做本地 OCR。源码由本脚本临时编译，不会在问卷目录生成额外文件。
-PDF_HELPER_SOURCE = r'''
-import Foundation
-import PDFKit
-import Vision
-import AppKit
-
-guard CommandLine.arguments.count == 2 else { exit(2) }
-guard let document = PDFDocument(url: URL(fileURLWithPath: CommandLine.arguments[1])) else {
-    fputs("无法打开 PDF\n", stderr)
-    exit(3)
-}
-
-for pageNumber in 0..<document.pageCount {
-    guard let page = document.page(at: pageNumber) else { continue }
-    if let text = page.string,
-       !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-        print(text)
-        continue
-    }
-
-    let bounds = page.bounds(for: .mediaBox)
-    let scale: CGFloat = 2.0
-    let width = Int(bounds.width * scale)
-    let height = Int(bounds.height * scale)
-    guard let bitmap = NSBitmapImageRep(
-        bitmapDataPlanes: nil,
-        pixelsWide: width,
-        pixelsHigh: height,
-        bitsPerSample: 8,
-        samplesPerPixel: 4,
-        hasAlpha: true,
-        isPlanar: false,
-        colorSpaceName: .deviceRGB,
-        bytesPerRow: 0,
-        bitsPerPixel: 0
-    ), let context = NSGraphicsContext(bitmapImageRep: bitmap) else {
-        fputs("无法渲染 PDF 第 \(pageNumber + 1) 页\n", stderr)
-        exit(4)
-    }
-
-    NSGraphicsContext.saveGraphicsState()
-    NSGraphicsContext.current = context
-    context.cgContext.setFillColor(NSColor.white.cgColor)
-    context.cgContext.fill(CGRect(x: 0, y: 0, width: width, height: height))
-    context.cgContext.scaleBy(x: scale, y: scale)
-    page.draw(with: .mediaBox, to: context.cgContext)
-    NSGraphicsContext.restoreGraphicsState()
-
-    guard let image = bitmap.cgImage else {
-        fputs("无法生成 PDF 第 \(pageNumber + 1) 页图像\n", stderr)
-        exit(5)
-    }
-
-    let request = VNRecognizeTextRequest()
-    request.recognitionLevel = .accurate
-    request.recognitionLanguages = ["zh-Hans", "en-US"]
-    request.usesLanguageCorrection = false
-    let handler = VNImageRequestHandler(cgImage: image, options: [:])
-    do {
-        try handler.perform([request])
-    } catch {
-        fputs("PDF 第 \(pageNumber + 1) 页 OCR 失败：\(error)\n", stderr)
-        exit(6)
-    }
-
-    let observations = (request.results ?? []).sorted {
-        if abs($0.boundingBox.midY - $1.boundingBox.midY) > 0.01 {
-            return $0.boundingBox.midY > $1.boundingBox.midY
-        }
-        return $0.boundingBox.minX < $1.boundingBox.minX
-    }
-    for observation in observations {
-        if let candidate = observation.topCandidates(1).first {
-            print(candidate.string)
-        }
-    }
-}
-'''
-
 
 class ExtractionError(Exception):
     """问卷内容不符合预期格式。"""
@@ -223,89 +140,41 @@ def legacy_doc_paragraphs(path: Path) -> list[str]:
     raise ExtractionError("无法转换旧版 .doc：" + "；".join(failures))
 
 
-def compile_pdf_helper() -> Path:
-    """在系统临时目录编译并缓存 macOS PDF/OCR 小工具。"""
-    if sys.platform != "darwin":
-        raise ExtractionError(
-            "扫描版 PDF 的自动识别目前需要 macOS；"
-            "请将 PDF 转为可搜索 PDF 或 DOCX 后再运行。"
-        )
-
-    swiftc = shutil.which("swiftc")
-    if not swiftc:
-        raise ExtractionError(
-            "系统中没有 swiftc，无法启用 PDF/OCR。"
-            "请安装 Apple Command Line Tools，或将 PDF 转为 DOCX。"
-        )
-
-    source_hash = hashlib.sha256(PDF_HELPER_SOURCE.encode("utf-8")).hexdigest()[:16]
-    cache_dir = Path(tempfile.gettempdir()) / "questionnaire_pdf_reader"
-    executable = cache_dir / f"pdf_reader_{source_hash}"
-    if executable.is_file() and os.access(executable, os.X_OK):
-        return executable
-
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    module_cache = cache_dir / "module_cache"
-    module_cache.mkdir(exist_ok=True)
-    source_file: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            prefix="pdf_reader_",
-            suffix=".swift",
-            dir=cache_dir,
-            delete=False,
-        ) as stream:
-            stream.write(PDF_HELPER_SOURCE)
-            source_file = Path(stream.name)
-
-        environment = os.environ.copy()
-        environment["SWIFT_MODULECACHE_PATH"] = str(module_cache)
-        environment["CLANG_MODULE_CACHE_PATH"] = str(module_cache)
-        result = subprocess.run(
-            [swiftc, str(source_file), "-o", str(executable)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=120,
-            env=environment,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ExtractionError(f"编译 PDF 识别组件失败：{exc}") from exc
-    finally:
-        if source_file is not None:
-            source_file.unlink(missing_ok=True)
-
-    if result.returncode != 0 or not executable.is_file():
-        detail = decode_command_output(result.stderr).strip()
-        raise ExtractionError(f"编译 PDF 识别组件失败：{detail or '未知错误'}")
-    return executable
-
-
 def pdf_paragraphs(path: Path) -> list[str]:
-    """读取 PDF；没有文本层的页面会自动使用中文 OCR。"""
-    helper = compile_pdf_helper()
+    """PyMuPDF 读取文字 PDF；扫描页与含大幅扫描图的页面使用本地 RapidOCR。"""
     try:
-        result = subprocess.run(
-            [str(helper), str(path.resolve())],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=180,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ExtractionError(f"PDF 读取/OCR 失败：{exc}") from exc
+        import pymupdf
+        # 与登记程序共用已验证的本地识别组件，支持从任意工作目录直接运行。
+        account_dir = str(BASE_DIR.parent)
+        if account_dir not in sys.path:
+            sys.path.insert(0, account_dir)
+        from 客户信息登记.ocr_support import PDFReader, rows
 
-    if result.returncode != 0:
-        detail = decode_command_output(result.stderr).strip()
-        raise ExtractionError(f"PDF 读取/OCR 失败：{detail or f'退出码 {result.returncode}'}")
-
-    text = decode_command_output(result.stdout).replace("\r\n", "\n").replace("\r", "\n")
-    paragraphs = [normalize_text(line) for line in text.split("\n") if normalize_text(line)]
-    if not paragraphs:
-        raise ExtractionError("PDF 中没有识别到文字")
-    return paragraphs
+        reader = PDFReader(BASE_DIR / '.ocr-cache')
+        paragraphs = []
+        with pymupdf.open(path) as document:
+            if document.needs_pass:
+                raise ExtractionError('PDF 有打开密码，请先提供无密码的副本')
+            for index, page in enumerate(document):
+                # 有些扫描页另加了文字页码，不能因存在少量文字层就漏掉整页问卷。
+                page_area = page.rect.get_area()
+                scanned = any(pymupdf.Rect(info['bbox']).get_area() >= page_area * .35
+                              for info in page.get_image_info())
+                lines, _ = reader.oriented_page(path, index, force_ocr=scanned)
+                paragraphs.extend(normalize_text(''.join(item.text for item in group))
+                                  for group in rows(lines))
+        # OCR 可能把两位题号读成“1 3.”；只去掉题号内部空格，不猜测数字或答案。
+        paragraphs = [re.sub(r'^(\s*(?:第\s*)?\d)\s+(\d)(?=\s*[.、:：])',
+                             r'\1\2', text) for text in paragraphs if text]
+        if not paragraphs:
+            raise ExtractionError('PDF 中没有识别到文字')
+        return paragraphs
+    except ExtractionError:
+        raise
+    except ImportError as exc:
+        raise ExtractionError('PDF 识别依赖缺失，请安装 account/requirements.txt：' + str(exc)) from exc
+    except Exception as exc:
+        raise ExtractionError(f'PDF 读取/OCR 失败：{exc}') from exc
 
 
 def read_paragraphs(path: Path) -> list[str]:

@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -26,17 +27,17 @@ class Line:
 
 class PDFReader:
     def __init__(self, cache: Path):
-        self.cache = cache
+        self.cache = Path(os.environ['ACCOUNT_OCR_CACHE']) if os.environ.get('ACCOUNT_OCR_CACHE') else cache
         self.engine = None
         self.hashes: dict[Path, str] = {}
 
     def page(self, path: Path, index: int, crop=None, scale=2.5, rotation=0,
-             use_cls=True, suppress_red=False) -> list[Line]:
+             use_cls=True, suppress_red=False, force_ocr=False) -> list[Line]:
         if path not in self.hashes:
             self.hashes[path] = hashlib.sha256(path.read_bytes()).hexdigest()
         key = hashlib.sha256(
             repr(('v2', self.hashes[path], index, crop, scale, rotation,
-                  use_cls, suppress_red)).encode()
+                  use_cls, suppress_red) + (('force_ocr',) if force_ocr else ())).encode()
         ).hexdigest()
         target = self.cache / f'{key}.json'
         if target.exists():
@@ -50,7 +51,7 @@ class PDFReader:
             if crop is not None:
                 rect = pymupdf.Rect(crop[0]*width, crop[1]*height,
                                     crop[2]*width, crop[3]*height)
-            words = page.get_text('words')
+            words = [] if force_ocr else page.get_text('words')
             if words:
                 # PDF 文本坐标不随页面 rotation 改变，须转换到显示坐标后再裁剪。
                 lines = []
@@ -61,8 +62,7 @@ class PDFReader:
                                           box.x1/width, box.y1/height))
             else:
                 if self.engine is None:
-                    from rapidocr import RapidOCR
-                    self.engine = RapidOCR()
+                    self.engine = create_ocr_engine()
                 print(f'OCR：{path.name} 第 {index+1} 页 / 旋转 {rotation}°'
                       + ('（局部）' if crop else ''), flush=True)
                 pix = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale),
@@ -91,9 +91,9 @@ class PDFReader:
         target.write_text(json.dumps([asdict(line) for line in lines], ensure_ascii=False, indent=2), 'utf-8')
         return lines
 
-    def oriented_page(self, path: Path, index: int, keywords=()) -> tuple[list[Line], int]:
+    def oriented_page(self, path: Path, index: int, keywords=(), force_ocr=False) -> tuple[list[Line], int]:
         """用文字方向及可读关键词选择页面方向，不依据纸张横竖或固定页码。"""
-        lines = self.page(path, index, use_cls=False)
+        lines = self.page(path, index, use_cls=False, force_ocr=force_ocr)
 
         def quality(items):
             horizontal = [x for x in items if x.x1-x.x0 > x.y1-x.y0]
@@ -106,9 +106,27 @@ class PDFReader:
                 or (keywords and not any(w in x.text for x in lines for w in keywords))):
             choices = [(lines, 0)]
             for rotation in (90, 270, 180):
-                choices.append((self.page(path, index, rotation=rotation, use_cls=False), rotation))
+                choices.append((self.page(path, index, rotation=rotation, use_cls=False,
+                                          force_ocr=force_ocr), rotation))
             return max(choices, key=lambda item: quality(item[0]))
         return lines, 0
+
+
+def create_ocr_engine():
+    """桌面版明确指定随软件分发的模型，避免运行时下载或写入安装目录。"""
+    from rapidocr import RapidOCR
+    model_dir = os.environ.get('ACCOUNT_OCR_MODEL_DIR')
+    if not model_dir:
+        return RapidOCR()
+    params = {'Global.log_level': 'warning'}
+    for kind, name in [('Det', 'PP-OCRv6_det_small.onnx'),
+                       ('Cls', 'ch_ppocr_mobile_v2.0_cls_mobile.onnx'),
+                       ('Rec', 'PP-OCRv6_rec_small.onnx')]:
+        path = Path(model_dir)/name
+        if not path.is_file():
+            raise RuntimeError(f'缺少识别模型 {name}，请重新解压完整软件包')
+        params[f'{kind}.model_path'] = str(path)
+    return RapidOCR(params=params)
 
 
 def rows(lines: list[Line]) -> list[list[Line]]:
