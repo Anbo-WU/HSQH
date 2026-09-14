@@ -21,7 +21,10 @@ from openpyxl.workbook.workbook import Workbook
 from openpyxl.worksheet.worksheet import Worksheet
 import pymupdf
 
-from ocr_support import Line, PDFReader, rows
+if __package__:
+    from .ocr_support import Line, PDFReader, rows
+else:
+    from ocr_support import Line, PDFReader, rows
 
 BASE = Path(__file__).resolve().parent
 SHEET1 = '场外衍生品协议的签署'
@@ -30,7 +33,8 @@ KYC_MAP = {
     'B': ('基本信息表', 'C6'), 'F': ('交易信息', 'C8'),
     'G': ('交易信息', 'C7'), 'H': ('交易信息', 'C10'),
     'I': ('基本信息表', 'C12'), 'J': ('基本信息表', 'C13'),
-    'M': ('基本信息表', 'C7'), 'N': ('基本信息表', 'C14'),
+    'L': ('基本信息表', 'C8'), 'M': ('基本信息表', 'C7'),
+    'N': ('基本信息表', 'C14'),
     'O': ('基本信息表', 'C21'),
     'P': ('基本信息表', 'C23'), 'Q': ('基本信息表', 'C24'),
     'U': ('交易信息', 'C9'), 'V': ('交易信息', 'C10'),
@@ -40,6 +44,8 @@ KYC_MAP = {
     'AI': ('基本信息表', 'D52'), 'AJ': ('基本信息表', 'D61'),
 }
 AUTH_MAP = {'C': 'B14', 'E': 'H14', 'F': 'E14', 'G': 'F14', 'H': 'I14'}
+BENEFICIARY_ID_LABEL = r'^\*?(?:身份证件|身份证|证件)(?:号码|编号)'
+BENEFICIARY_VALIDITY_LABEL = r'^\*?(?:身份证件|身份证|证件)?有[效限]期(?:限)?'
 DATE_RE = re.compile(r'(?<!\d)((?:19|20)\d{2})\s*[年./-]\s*(\d{1,2})\s*[月./-]\s*(\d{1,2})(?:日)?(?!\d)')
 
 
@@ -135,12 +141,13 @@ def label_value(lines: list[Line], label: str) -> tuple[str, list[Line]]:
     raise ValueError(f'没有找到“{label}”对应内容')
 
 
-def beneficiary_names(pages: list[list[Line]]) -> tuple[str, list[Line]]:
-    names = []
-    evidence = []
+def beneficiary_entries(pages: list[list[Line]]) -> list[tuple[str, list[Line], list[Line], int]]:
+    """按姓名栏切分人员区块，证件信息只能在对应人员区块内取值。"""
+    entries = []
     uncertain = []
-    for lines in pages:
+    for page_index, lines in enumerate(pages, 1):
         groups = rows(lines)
+        starts = []
         for index, group in enumerate(groups):
             context = compact(' '.join(row_text(r) for r in groups[max(0, index-2):index+1]))
             if not any(word in context for word in ('股东/控制人/高管', '股东、控制人、高管')):
@@ -155,16 +162,33 @@ def beneficiary_names(pages: list[list[Line]]) -> tuple[str, list[Line]]:
                         break
                     values.append(item)
                 name = inline or ''.join(compact(item.text) for item in values)
-                if name and re.fullmatch(r'[\u4e00-\u9fffA-Za-z·.]{2,80}', name):
-                    if name not in names:
-                        names.append(name)
-                    evidence.extend([line] + values)
-                elif name or re.search(r'\d{15,18}[Xx]?', row_text(group)):
-                    uncertain.append(row_text(group))
+                starts.append((index, name, [line] + values))
+        for pos, (index, name, evidence) in enumerate(starts):
+            end = starts[pos+1][0] if pos+1 < len(starts) else len(groups)
+            block = [item for group in groups[index:end] for item in group]
+            if name and re.fullmatch(r'[\u4e00-\u9fffA-Za-z·.]{2,80}', name):
+                entries.append((name, evidence, block, page_index))
+            else:
+                has_details = bool(name)
+                for pattern in (BENEFICIARY_ID_LABEL, BENEFICIARY_VALIDITY_LABEL):
+                    try:
+                        beneficiary_document_value(block, pattern)
+                        has_details = True
+                    except ValueError:
+                        pass
+                if has_details:
+                    uncertain.append(row_text(groups[index]))
     if uncertain:
-        raise ValueError('部分受益人姓名未识别完整；已识别：' + '、'.join(names) + '；请核对整份采集表')
-    if not names:
+        raise ValueError('部分受益人姓名未识别完整；已识别：' + '、'.join(dict.fromkeys(x[0] for x in entries)) + '；请核对整份采集表')
+    if not entries:
         raise ValueError('没有识别出“股东/控制人/高管”姓名')
+    return entries
+
+
+def beneficiary_names(pages: list[list[Line]]) -> tuple[str, list[Line]]:
+    entries = beneficiary_entries(pages)
+    names = list(dict.fromkeys(x[0] for x in entries))
+    evidence = [line for _, items, _, _ in entries for line in items]
     return '、'.join(names), evidence
 
 
@@ -291,6 +315,108 @@ def extracted(value, source: str, lines: list[Line], note='') -> Field:
     return Field(value, source, row_text(lines), note=note)
 
 
+def beneficiary_document_value(block: list[Line], pattern: str) -> tuple[str, list[Line]]:
+    candidates = []
+    groups = rows(block)
+    for index, group in enumerate(groups):
+        for pos, label in enumerate(group):
+            match = re.match(pattern, compact(label.text))
+            if not match:
+                continue
+            text = compact(label.text)[match.end():].lstrip(':：')
+            evidence = [label]
+            for item in group[pos+1:]:
+                if re.search(r'姓名|证件|国籍|地址', item.text):
+                    break
+                text += compact(item.text)
+                evidence.append(item)
+            # 号码或日期可能在同一格换行；只接续标签右侧的数字/日期文字。
+            last_y = label.cy
+            for following in groups[index+1:]:
+                if min(x.cy for x in following)-last_y > .04:
+                    break
+                if any(re.search(r'姓名|证件|国籍|地址|签署', x.text) for x in following):
+                    break
+                right = [x for x in following if x.x0 >= label.x1-.008]
+                if not right or any(not re.fullmatch(r'[\dXx年月日./—–~～至到长期永久有效\-]+', compact(x.text)) for x in right):
+                    break
+                text += ''.join(compact(x.text) for x in right)
+                evidence.extend(right)
+                last_y = max(x.cy for x in following)
+            if text:
+                candidates.append((text, evidence))
+    if len(candidates) != 1:
+        raise ValueError('证件栏目为空、未识别或不能唯一定位')
+    return candidates[0]
+
+
+def beneficiary_id(text: str) -> str:
+    text = compact(text).upper()
+    if not re.fullmatch(r'\d{17}[\dX]|\d{15}', text):
+        raise ValueError('身份证号码位数或字符不完整')
+    birth = text[6:14] if len(text) == 18 else '19'+text[6:12]
+    try:
+        datetime.strptime(birth, '%Y%m%d')
+    except ValueError as exc:
+        raise ValueError('身份证号码中的出生日期不合法') from exc
+    if len(text) == 18:
+        weights = (7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2)
+        expected = '10X98765432'[sum(int(n)*w for n, w in zip(text[:17], weights)) % 11]
+        if text[-1] != expected:
+            raise ValueError('身份证号码校验位不一致，请核对扫描原件')
+    return text
+
+
+def beneficiary_validity(text: str) -> str:
+    text = compact(text)
+    found = dates(text)
+    if text in {'长期', '长期有效', '永久'}:
+        return '长期'
+    date_pattern = r'(?:19|20)\d{2}[年./-]\d{1,2}[月./-]\d{1,2}日?'
+    if not re.fullmatch(rf'{date_pattern}(?:至|到|[-—–~～])(?:{date_pattern}|长期(?:有效)?|永久)', text):
+        raise ValueError('未识别出完整的身份证有效期起止日期')
+    if len(found) == 1 and text.endswith(('长期', '长期有效', '永久')):
+        return found[0].replace('-', '.')+'-长期'
+    if len(found) != 2 or found[0] > found[1]:
+        raise ValueError('身份证有效期日期不合法或起止顺序错误')
+    return '-'.join(x.replace('-', '.') for x in found)
+
+
+def beneficiary_fields(pages: list[list[Line]], source: str) -> dict[str, Field]:
+    entries = beneficiary_entries(pages)
+    names = list(dict.fromkeys(x[0] for x in entries))
+    name_evidence = [line for _, evidence, _, _ in entries for line in evidence]
+    result = {'R': extracted('、'.join(names), source+' / 全部页面 / 股东/控制人/高管', name_evidence)}
+    for col, label, pattern, parse in (
+        ('S', '身份证件号码', BENEFICIARY_ID_LABEL, beneficiary_id),
+        ('T', '身份证件有效期', BENEFICIARY_VALIDITY_LABEL, beneficiary_validity),
+    ):
+        values = {name: set() for name in names}
+        evidence, errors = [], []
+        for name, _, block, page in entries:
+            try:
+                raw, items = beneficiary_document_value(block, pattern)
+                evidence.extend(items)
+                value = parse(raw)
+                if any(x.score < .85 for x in items):
+                    raise ValueError('OCR 置信度不足')
+                values[name].add(value)
+            except ValueError as exc:
+                errors.append(f'{name}（第{page}页）：{exc}')
+        if result['R'].value is None:
+            errors.append('受益人姓名未确认，不能确定证件对应关系')
+        for name, found in values.items():
+            if len(found) > 1:
+                errors.append(f'{name} 的{label}在不同位置不一致')
+        field_source = source+' / 全部页面 / 按 R 列姓名顺序配对 / '+label
+        if errors:
+            result[col] = Field(source=field_source, evidence=row_text(evidence), status='待核对', note='；'.join(errors))
+        else:
+            result[col] = Field('、'.join(next(iter(values[name])) for name in names), field_source,
+                                row_text(evidence), note=f'与 {len(names)} 位受益人逐一对应')
+    return result
+
+
 def credit_score(reader: PDFReader, path: Path, index: int, lines: list[Line]) -> Field:
     source = f'{path.name} / 第{index+1}页各处综合评分'
     scores, evidence, notes, errors = [], [], [], []
@@ -358,16 +484,80 @@ def get_sheet(book: Workbook, title: str) -> Worksheet:
     return matches[0]
 
 
+def kyc_value(item: Cell) -> str:
+    value = item.value
+    if value is None or str(value).strip() == '' or item.data_type == 'e':
+        raise ValueError('来源单元格为空、公式无缓存或含错误')
+    if isinstance(value, (date, datetime)):
+        return value.strftime('%Y-%m-%d')
+    if isinstance(value, (float, int)):
+        if abs(value) >= 10**15:
+            raise ValueError('长号码以 Excel 数值保存，可能已丢失精度，请将源号码改为文本')
+        value = str(int(value)) if float(value).is_integer() else str(value)
+        if re.fullmatch(r'0+', item.number_format):
+            value = value.zfill(len(item.number_format))
+        return value
+    return str(value).strip()
+
+
+def read_authorizations(sheet: Worksheet, source: str) -> dict[str, Field]:
+    columns = {col: re.sub(r'\d+', '', cell) for col, cell in AUTH_MAP.items()}
+    records, orphan_rows, name_errors = [], [], []
+    counts = dict.fromkeys(columns, 0)
+    evidence = {col: [] for col in columns}
+    for row in range(14, max(14, sheet.max_row)+1):
+        values, errors = {}, {}
+        for col, source_col in columns.items():
+            item = sheet[f'{source_col}{row}']
+            if item.value is not None and str(item.value).strip():
+                evidence[col].append(f'{item.coordinate}：{item.value}')
+            try:
+                values[col] = kyc_value(item)
+                counts[col] += 1
+            except ValueError as exc:
+                errors[col] = f'{item.coordinate}：{exc}'
+        name_cell = sheet[f'B{row}']
+        if 'C' not in values:
+            if name_cell.value is not None and str(name_cell.value).strip():
+                name_errors.append(errors['C'])
+            if any(col != 'C' for col in values) or any(
+                    sheet[f'{c}{row}'].value is not None and str(sheet[f'{c}{row}'].value).strip()
+                    for col, c in columns.items() if col != 'C'):
+                orphan_rows.append(row)
+            continue
+        records.append((row, values, errors))
+    summary = '数量校对：'+ '；'.join(f'{label} {counts[col]}' for col, label in
+        [('C', '授权人'), ('E', '手机号'), ('F', '身份证号'), ('G', '身份证有效期'), ('H', '邮箱')])
+    common_errors = name_errors[:]
+    if not records:
+        common_errors.append('B14 及以下未找到有效交易授权人')
+    if orphan_rows:
+        common_errors.append('以下行有授权信息但姓名为空或错误：'+ '、'.join(map(str, orphan_rows)))
+    result = {}
+    for col, source_col in columns.items():
+        errors = common_errors + [f'{values["C"]}（第{row}行）：{issues[col]}'
+                                 for row, values, issues in records if col in issues]
+        field_source = f'{source} / {source_col}14:{source_col}{max(14, sheet.max_row)}'
+        if errors:
+            result[col] = Field(source=field_source, evidence='\n'.join(evidence[col]),
+                                status='待核对', note=summary+'；'+'；'.join(errors))
+        else:
+            result[col] = Field('，'.join(values[col] for _, values, _ in records), field_source,
+                                '\n'.join(evidence[col]), note=summary+'；按 B 列姓名所在行逐一对应，重复值保留')
+    return result
+
+
 def read_kyc(folder: Path) -> tuple[dict[str, Field], dict[str, Field]]:
     main, auth = {}, {}
     mapping = [(main, col, sheet, cell) for col, (sheet, cell) in KYC_MAP.items()]
-    mapping += [(auth, col, '交易授权', cell) for col, cell in AUTH_MAP.items()]
     try:
         path = unique_file(folder/'0.OA', lambda p: 'KYC' in p.name.upper() and p.suffix.lower() == '.xlsx')
         book = load_workbook(path, data_only=True)
     except Exception as exc:
         for target, col, sheet, cell in mapping:
             target[col] = Field(source=f'KYC / {sheet} / {cell}', status='待核对', note=str(exc))
+        auth = {col: Field(source=f'KYC / 交易授权 / {cell}往下', status='待核对', note=str(exc))
+                for col, cell in AUTH_MAP.items()}
         return main, auth
     try:
         for target, col, sheet, cell in mapping:
@@ -375,39 +565,19 @@ def read_kyc(folder: Path) -> tuple[dict[str, Field], dict[str, Field]]:
             try:
                 worksheet = get_sheet(book, sheet)
                 source = f'{path.relative_to(folder)} / {worksheet.title} / {cell}'
-                if target is auth and col == 'C':
-                    source = f'{path.relative_to(folder)} / {worksheet.title} / B14:B{max(14, worksheet.max_row)}'
-                    names, evidence = [], []
-                    for row in worksheet.iter_rows(min_row=14, min_col=2, max_col=2):
-                        item = row[0]
-                        if item.data_type == 'e':
-                            raise ValueError(f'来源单元格 {item.coordinate} 含错误')
-                        if item.value is not None and str(item.value).strip():
-                            names.append(str(item.value).strip())
-                            evidence.append(f'{item.coordinate}：{item.value}')
-                    if not names:
-                        raise ValueError('B14 及以下未找到非空交易授权人')
-                    target[col] = Field('，'.join(names), source, '\n'.join(evidence))
-                    continue
                 item = worksheet[cell]
-                value = item.value
-                if value is None or str(value).strip() == '' or item.data_type == 'e':
-                    raise ValueError('来源单元格为空、公式无缓存或含错误')
-                if isinstance(value, (date, datetime)):
-                    value = value.strftime('%Y-%m-%d')
-                elif isinstance(value, (float, int)):
-                    if abs(value) >= 10**15:
-                        raise ValueError('长号码以 Excel 数值保存，可能已丢失精度，请将源号码改为文本')
-                    value = str(int(value)) if float(value).is_integer() else str(value)
-                    if re.fullmatch(r'0+', item.number_format):
-                        value = value.zfill(len(item.number_format))
-                else:
-                    value = str(value).strip()
+                value = kyc_value(item)
                 if target is main and col == 'Q':
                     value = expiry(value)
                 target[col] = Field(value, source, str(item.value))
             except Exception as exc:
                 target[col] = Field(source=source, status='待核对', note=str(exc))
+        try:
+            worksheet = get_sheet(book, '交易授权')
+            auth = read_authorizations(worksheet, f'{path.relative_to(folder)} / {worksheet.title}')
+        except Exception as exc:
+            auth = {col: Field(source=f'{path.relative_to(folder)} / 交易授权 / {cell}往下',
+                               status='待核对', note=str(exc)) for col, cell in AUTH_MAP.items()}
     finally:
         book.close()
     return main, auth
@@ -416,6 +586,7 @@ def read_kyc(folder: Path) -> tuple[dict[str, Field], dict[str, Field]]:
 def collect_customer(folder: Path, reader: PDFReader) -> tuple[dict, dict]:
     main, auth = read_kyc(folder)
     main['BA'] = Field(suitability(folder.name), '客户文件夹名称', folder.name)
+    main['AK'] = replace(main['BA'], source='与 BA 列一致 / 客户文件夹名称')
 
     def task(columns, source, func):
         try:
@@ -434,8 +605,7 @@ def collect_customer(folder: Path, reader: PDFReader) -> tuple[dict, dict]:
         path = document(folder, 13)
         with pymupdf.open(path) as doc:
             pages = [reader.page(path, i) for i in range(len(doc))]
-        value, evidence = beneficiary_names(pages)
-        return {'R': extracted(value, f'{path.name} / 全部页面 / 股东/控制人/高管', evidence)}
+        return beneficiary_fields(pages, path.name)
 
     def license_fields():
         path = document(folder, 14)
@@ -554,7 +724,7 @@ def collect_customer(folder: Path, reader: PDFReader) -> tuple[dict, dict]:
         return result
 
     task(['K'], '1.交易者基本信息表', nature)
-    task(['R'], '13.受益人信息采集表', beneficiaries)
+    task(['R', 'S', 'T'], '13.受益人信息采集表', beneficiaries)
     task(['AC'], '14.营业执照', license_fields)
     task(['AD', 'AE', 'AG'], '16.财报表 / 全部页面关键词识别', finance)
     task(['AL'], '5.普通交易者适当性匹配意见告知书 / 第1页', rating_date)
@@ -617,13 +787,16 @@ def write_result(
                     cell.number_format = '@'
                 elif isinstance(field.value, (int, float)):
                     cell.number_format = '0.00' if col in {'AC','AD','AE','AF','AG'} else '0.##'
+                if sheet.title == SHEET1 and col in {'AD', 'AE', 'AF', 'AG', 'BC'}:
+                    cell.number_format = '0.0' if col == 'BC' else '#,##0.00'
                 cell.comment = Comment(f'来源：{field.source}\n状态：{field.status}\n识别原文：{field.evidence}\n{field.note}', '客户信息登记')
                 if field.status == '待核对':
                     cell.fill = PatternFill('solid', fgColor='FFF2CC')
                 audit.append({'客户文件夹': folder.name, '工作表': sheet.title,
                               '单元格': cell.coordinate, '字段': sheet[f'{col}2'].value, **asdict(field)})
             if sheet.title == SHEET1:
-                sheet[f'AH{rownum}'] = f'=IF(AND(ISNUMBER(AD{rownum}),ISNUMBER(AE{rownum})),IFERROR(AE{rownum}/AD{rownum}*100,""),"")'
+                sheet[f'AH{rownum}'] = f'=IF(AND(ISNUMBER(AD{rownum}),ISNUMBER(AE{rownum})),IFERROR(AE{rownum}/AD{rownum},""),"")'
+                sheet[f'AH{rownum}'].number_format = '0.00%'
     output.parent.mkdir(parents=True, exist_ok=True)
     book.save(output)
     book.close()

@@ -3,13 +3,15 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock
+from dataclasses import replace
 
 import pymupdf
 from openpyxl import Workbook, load_workbook
 
 from 登记 import (beneficiary_names, capital_wan, credit_class, dates, expiry,
                 financial_value, question18, suitability, continuation_headers,
-                credit_score, collect_customer, write_result, BASE, SHEET1)
+                credit_score, collect_customer, write_result, read_kyc, read_authorizations,
+                beneficiary_fields, beneficiary_validity, Field, BASE, SHEET1, SHEET2)
 from ocr_support import Line, PDFReader
 
 
@@ -17,7 +19,164 @@ def line(text, x, y, width=.07):
     return Line(text, .99, x, y-.006, x+width, y+.006)
 
 
+def beneficiary(name, y=.25, identity='11010519491231002X', validity='2021.08.11-2041.08.11'):
+    result = [line('*股东/控制人/高管', .06, y, .14), line('*姓名', .21, y),
+              line('*身份证件号码', .55, y, .12),
+              line('*身份证件有限期', .55, y+.025, .12)]
+    if name:
+        result.append(line(name, .33, y))
+    if identity:
+        result.append(line(identity, .70, y, .2))
+    if validity:
+        result.append(line(validity, .70, y+.025, .25))
+    return result
+
+
+def authorization_sheet():
+    book = Workbook()
+    sheet = book.active
+    sheet.title = '交易授权'
+    # 故意留一空行；相同的手机号和邮箱也要逐人保留。
+    for row, name in [(14, '张三'), (16, '李四')]:
+        for col, value in {'B': name, 'H': 13800000000, 'E': '11010519491231002X',
+                           'F': '2021.08.11-2041.08.11', 'I': 'shared@example.com'}.items():
+            sheet[f'{col}{row}'] = value
+    return sheet
+
+
 class RegistrationTests(unittest.TestCase):
+    def test_authorization_columns_share_rows_and_keep_duplicates(self):
+        fields = read_authorizations(authorization_sheet(), 'KYC')
+        self.assertEqual(fields['C'].value, '张三，李四')
+        self.assertEqual(fields['E'].value, '13800000000，13800000000')
+        self.assertEqual(fields['H'].value, 'shared@example.com，shared@example.com')
+        for field in fields.values():
+            self.assertEqual(field.status, '已提取')
+            self.assertEqual(len(field.value.split('，')), 2)
+            self.assertIn('授权人 2', field.note)
+        self.assertIn('H16', fields['E'].evidence)
+
+    def test_authorization_missing_middle_value_does_not_shift_next_person(self):
+        sheet = authorization_sheet()
+        sheet['H14'] = None
+        fields = read_authorizations(sheet, 'KYC')
+        self.assertIsNone(fields['E'].value)
+        self.assertEqual(fields['E'].status, '待核对')
+        self.assertIn('张三（第14行）', fields['E'].note)
+        self.assertIn('手机号 1', fields['E'].note)
+        self.assertEqual(fields['C'].value, '张三，李四')
+        self.assertEqual(fields['H'].status, '已提取')
+
+    def test_authorization_equal_counts_but_different_rows_are_rejected(self):
+        sheet = authorization_sheet()
+        sheet['H14'] = None
+        sheet['H15'] = 13900000000
+        fields = read_authorizations(sheet, 'KYC')
+        for field in fields.values():
+            self.assertEqual(field.status, '待核对')
+            self.assertIsNone(field.value)
+            self.assertIn('姓名为空或错误：15', field.note)
+
+    def test_authorization_errors_and_numeric_id_precision(self):
+        for column, value in [('E', 110105194912310000), ('I', '#VALUE!'), ('F', '=A1')]:
+            with self.subTest(column=column):
+                with TemporaryDirectory() as tmp:
+                    folder = Path(tmp)
+                    (folder/'0.OA').mkdir()
+                    sheet = authorization_sheet()
+                    sheet[f'{column}16'] = value
+                    sheet.parent.save(folder/'0.OA/00.KYC.xlsx')
+                    _, fields = read_kyc(folder)
+                    target = {'E': 'F', 'I': 'H', 'F': 'G'}[column]
+                    self.assertIsNone(fields[target].value)
+                    self.assertIn(f'{column}16', fields[target].note)
+
+    def test_qualification_and_suitability_copy(self):
+        with TemporaryDirectory() as tmp:
+            folder = Path(tmp)/'001、测试公司-C5'
+            (folder/'0.OA').mkdir(parents=True)
+            book = Workbook()
+            book.active.title = '基本信息表'
+            book.active['C8'] = '民营企业'
+            book.save(folder/'0.OA/00.KYC.xlsx')
+            fields, _ = collect_customer(folder, Mock())
+            self.assertEqual(fields['L'].value, '民营企业')
+            self.assertIn('C8', fields['L'].source)
+            self.assertEqual(fields['AK'].value, fields['BA'].value)
+            self.assertEqual(fields['AK'].value, 'C5')
+
+    def test_beneficiary_ids_and_dates_follow_names_across_pages(self):
+        pages = [beneficiary('张三')+beneficiary('', .55, '', ''),
+                 beneficiary('李四', validity='2022年1月1日至长期')+beneficiary('张三', .55)]
+        fields = beneficiary_fields(pages, '13.pdf')
+        self.assertEqual(fields['R'].value, '张三、李四')
+        self.assertEqual(fields['S'].value, '11010519491231002X、11010519491231002X')
+        self.assertEqual(fields['T'].value, '2021.08.11-2041.08.11、2022.01.01-长期')
+
+    def test_beneficiary_missing_id_does_not_take_next_person(self):
+        fields = beneficiary_fields([beneficiary('张三', identity='')+beneficiary('李四', .55)], '13.pdf')
+        self.assertIsNone(fields['S'].value)
+        self.assertIn('张三', fields['S'].note)
+        self.assertEqual(fields['R'].value, '张三、李四')
+        self.assertEqual(fields['T'].status, '已提取')
+
+    def test_beneficiary_conflicts_low_confidence_and_invalid_id(self):
+        fields = beneficiary_fields([beneficiary('张三')+beneficiary('张三', .55, validity='2022.01.01-2042.01.01')], '13.pdf')
+        self.assertEqual(fields['S'].status, '已提取')
+        self.assertIsNone(fields['T'].value)
+        for identity in ['110105194912310021', '11010519491231002', '11010519491331002X']:
+            self.assertIsNone(beneficiary_fields([beneficiary('张三', identity=identity)], '13.pdf')['S'].value)
+        entries = beneficiary('张三')
+        entries = [replace(x, score=.5) if x.text == '张三' else x for x in entries]
+        fields = beneficiary_fields([entries], '13.pdf')
+        self.assertTrue(all(f.value is None for f in fields.values()))
+
+    def test_beneficiary_wrapped_id_and_validity(self):
+        entries = beneficiary('张三', identity='110105194912', validity='2021.08.11-')
+        entries += [line('31002X', .70, .263, .2), line('2041.08.11', .70, .290, .2)]
+        fields = beneficiary_fields([entries], '13.pdf')
+        self.assertEqual(fields['S'].value, '11010519491231002X')
+        self.assertEqual(fields['T'].value, '2021.08.11-2041.08.11')
+
+    def test_beneficiary_blank_name_with_validity_is_not_ignored(self):
+        with self.assertRaisesRegex(ValueError, '姓名未识别完整'):
+            beneficiary_fields([beneficiary('张三')+beneficiary('', .55, '', '2021.01.01-2041.01.01')], '13.pdf')
+        fields = beneficiary_fields([beneficiary('张三')+beneficiary('', .55, '', '')+
+                                     [line('签署日期', .55, .9), line('2026.08.01', .70, .9)]], '13.pdf')
+        self.assertEqual(fields['R'].value, '张三')
+
+    def test_beneficiary_validity_validation(self):
+        self.assertEqual(beneficiary_validity('长期'), '长期')
+        for value in ['2021.02.30-2041.02.28', '2041.01.01-2021.01.01', '2041.01.01', '2021.01.01-2041.99.01']:
+            with self.assertRaises(ValueError):
+                beneficiary_validity(value)
+
+    def test_output_formats_formulas_and_text_ids_for_multiple_customers(self):
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp)/'result.xlsx'
+            main = {'B': Field('测试公司'), 'AD': Field(1234567.891), 'AE': Field(123456.7),
+                    'AF': Field(1111111.191), 'AG': Field(-1234.5), 'BC': Field(81.25),
+                    'S': Field('11010519491231002X')}
+            auth = read_authorizations(authorization_sheet(), 'KYC')
+            write_result(BASE/'场外衍生品中心客户信息登记表-模板.xlsx', output,
+                         [(Path('001、甲'), main, auth), (Path('002、乙'), main, auth)])
+            book = load_workbook(output)
+            for row in (3, 4):
+                for col in ('AD', 'AE', 'AF', 'AG'):
+                    self.assertEqual(book[SHEET1][f'{col}{row}'].number_format, '#,##0.00')
+                    self.assertEqual(book[SHEET1][f'{col}{row}'].value, main[col].value)
+                self.assertEqual(book[SHEET1][f'BC{row}'].number_format, '0.0')
+                ratio = book[SHEET1][f'AH{row}']
+                self.assertEqual(ratio.data_type, 'f')
+                self.assertEqual(ratio.number_format, '0.00%')
+                self.assertIn(f'AE{row}/AD{row}', ratio.value)
+                self.assertNotIn('*100', ratio.value)
+                self.assertIn('IFERROR', ratio.value)
+                self.assertEqual(book[SHEET1][f'S{row}'].data_type, 's')
+                self.assertEqual(book[SHEET2][f'F{row}'].data_type, 's')
+                self.assertEqual(book[SHEET2][f'C{row}'].value, '张三，李四')
+            book.close()
+
     def test_capital_units_and_chinese_numbers(self):
         for text, expected in [('壹仟万元整', 1000), ('壹亿贰仟万元整', 12000),
                                ('10000000元', 1000), ('1.5亿元', 15000),

@@ -1,6 +1,6 @@
 {
   "app": "场外衍生品工作助手",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "python": "3.12.14",
   "packages": {
     "PySide6": "6.11.2",
