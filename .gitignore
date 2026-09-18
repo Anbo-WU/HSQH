@@ -20,3 +20,4 @@ venv/
 # Local runtime history
 **/运行记录.json
 **/运行记录.jsonl
+/exe/
