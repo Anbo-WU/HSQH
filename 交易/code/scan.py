@@ -1,34 +1,34 @@
 #!/usr/bin/env python3
-"""识别“确认书扫描”中每份 PDF 首页的交易编号，并按规则重命名。
+"""识别每份拆分 PDF 首页的交易编号，并按规则安全重命名。
 
 例：
 【HFSY】0009-FWJY-2026072401
 -> 【HFSY】0009-FWJY-202607240120260724.pdf
 
-脚本使用 macOS 自带的 PDFKit 和 Vision OCR，不需要安装 Python 第三方库。
+特殊分段编号也会保留：
+【HFSY】0009-FWJY-2026072401-1
+-> 【HFSY】0009-FWJY-2026072401-120260724.pdf
+
+Windows 版使用本地 RapidOCR 和 ONNX Runtime，不依赖 macOS Vision。
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-import os
 import re
-import shutil
-import subprocess
 import sys
-import tempfile
 import unicodedata
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from windows_ocr import recognize_first_pages
 
-# 不依赖 OCR 必须准确识别书名号和 HFSY。Vision 偶尔会把 FWJY
-# 识别成 FW.JY，因此允许编号各固定字段之间混入少量分隔标点。
+
 OCR_SEPARATOR = r"[\s._·•,，:：/\\\-‐‑‒–—−]*"
+OCR_SUFFIX_SEPARATOR = r"[\s._·•,，:：/\\]*[-‐‑‒–—−]+[\s._·•,，:：/\\]*"
 TRANSACTION_PATTERN = re.compile(
-    r"(?<![0-9A-Z])([0-9OQILSZBGD|]{4})"
+    r"(?<![0-9A-Z])([0-9A-Z|]{4})"
     + OCR_SEPARATOR
     + r"([A-Z]"
     + OCR_SEPARATOR
@@ -38,78 +38,30 @@ TRANSACTION_PATTERN = re.compile(
     + OCR_SEPARATOR
     + r"[A-Z])?)"
     + OCR_SEPARATOR
-    + r"([0-9OQILSZBGD|]{10})(?![0-9A-Z])",
+    + r"([0-9OQILSZBGD|]{10})"
+    + r"(?:"
+    + OCR_SUFFIX_SEPARATOR
+    + r"([0-9OQILSZBGD|]+)"
+    + r")?"
+    + r"(?![0-9A-Z])",
     flags=re.IGNORECASE,
 )
-
 OCR_DIGIT_TRANSLATION = str.maketrans(
-    {"O": "0", "Q": "0", "D": "0", "I": "1", "L": "1", "|": "1", "Z": "2", "S": "5", "G": "6", "B": "8"}
+    {
+        "O": "0",
+        "Q": "0",
+        "D": "0",
+        "I": "1",
+        "L": "1",
+        "|": "1",
+        "Z": "2",
+        "S": "5",
+        "G": "6",
+        "B": "8",
+    }
 )
-
-
-SWIFT_OCR_SOURCE = r'''
-import Foundation
-import PDFKit
-import Vision
-import AppKit
-
-func recognize(_ path: String) -> [String: Any] {
-    let url = URL(fileURLWithPath: path)
-    guard let document = PDFDocument(url: url), let page = document.page(at: 0) else {
-        return ["path": path, "error": "无法打开 PDF 或 PDF 没有首页"]
-    }
-
-    let bounds = page.bounds(for: .mediaBox)
-    let width: CGFloat = 3000
-    let height = width * bounds.height / bounds.width
-    let image = page.thumbnail(
-        of: NSSize(width: width, height: height),
-        for: .mediaBox
-    )
-    var rect = NSRect(origin: .zero, size: image.size)
-    guard let cgImage = image.cgImage(
-        forProposedRect: &rect,
-        context: nil,
-        hints: nil
-    ) else {
-        return ["path": path, "error": "无法渲染 PDF 首页"]
-    }
-
-    do {
-        let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .accurate
-        request.recognitionLanguages = ["zh-Hans", "en-US"]
-        request.usesLanguageCorrection = true
-        try VNImageRequestHandler(cgImage: cgImage, options: [:]).perform([request])
-
-        // 交易编号固定在首页大标题下，只取页面最上方的识别结果。
-        var lines: [String] = []
-        for observation in (request.results ?? []).prefix(10) {
-            if let candidate = observation.topCandidates(1).first {
-                lines.append(candidate.string)
-            }
-        }
-        return ["path": path, "text": lines.joined(separator: "\n")]
-    } catch {
-        return ["path": path, "error": error.localizedDescription]
-    }
-}
-
-var output: [[String: Any]] = []
-for path in CommandLine.arguments.dropFirst() {
-    autoreleasepool {
-        output.append(recognize(path))
-    }
-}
-
-do {
-    let data = try JSONSerialization.data(withJSONObject: output)
-    FileHandle.standardOutput.write(data)
-} catch {
-    fputs("JSON output failed: \(error)\n", stderr)
-    exit(4)
-}
-'''
+OCR_DIGITLIKE_CHARACTERS = frozenset("0123456789OQILSZBGD|")
+COMPANY_CODE_PATTERN = re.compile(r"[0-9A-Z]{4}")
 
 
 @dataclass(frozen=True)
@@ -121,7 +73,7 @@ class RenamePlan:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("folder", type=Path, help="要识别并重命名的确认书扫描目录")
+    parser.add_argument("folder", type=Path, help="要识别并重命名的拆分 PDF 目录")
     parser.add_argument(
         "--preview",
         action="store_true",
@@ -141,76 +93,8 @@ def collect_pdfs(folder: Path) -> list[Path]:
     )
 
 
-def compile_ocr_helper(temp_folder: Path) -> Path:
-    swiftc = shutil.which("swiftc")
-    if swiftc is None:
-        raise RuntimeError(
-            "找不到 swiftc。请先安装 macOS Command Line Tools："
-            "xcode-select --install"
-        )
-
-    source_path = temp_folder / "pdf_first_page_ocr.swift"
-    executable_path = temp_folder / "pdf_first_page_ocr"
-    source_path.write_text(SWIFT_OCR_SOURCE, encoding="utf-8")
-
-    environment = os.environ.copy()
-    environment["SWIFT_MODULECACHE_PATH"] = str(temp_folder / "swift-cache")
-    environment["CLANG_MODULE_CACHE_PATH"] = str(temp_folder / "clang-cache")
-    command = [
-        swiftc,
-        "-framework",
-        "PDFKit",
-        "-framework",
-        "Vision",
-        "-framework",
-        "AppKit",
-        str(source_path),
-        "-o",
-        str(executable_path),
-    ]
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        env=environment,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"OCR 组件编译失败：\n{result.stderr.strip()}")
-    return executable_path
-
-
 def recognize_all(pdfs: list[Path]) -> dict[Path, str]:
-    with tempfile.TemporaryDirectory(prefix="confirm_ocr_") as temp_name:
-        helper = compile_ocr_helper(Path(temp_name))
-        command = [str(helper), *(str(path.resolve()) for path in pdfs)]
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"OCR 运行失败（退出码 {result.returncode}）：\n"
-                f"{result.stderr.strip()}"
-            )
-        try:
-            records = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("OCR 未返回有效结果。") from exc
-
-    recognized: dict[Path, str] = {}
-    errors: list[str] = []
-    for record in records:
-        path = Path(record["path"])
-        if "error" in record:
-            errors.append(f"{path.name}: {record['error']}")
-        else:
-            recognized[path] = record.get("text", "")
-    if errors:
-        raise RuntimeError("OCR 失败：\n  " + "\n  ".join(errors))
-    return recognized
+    return recognize_first_pages(pdfs)
 
 
 def normalize_text(text: str) -> str:
@@ -240,45 +124,68 @@ def normalize_trade_type(raw_type: str, expected_type: str | None) -> str | None
     return None
 
 
+def normalize_company_code(raw_code: str) -> str | None:
+    """规范四位机构代码，同时保留原有纯数字代码的 OCR 纠错。"""
+    company_code = raw_code.upper()
+    if all(character in OCR_DIGITLIKE_CHARACTERS for character in company_code):
+        corrected = company_code.translate(OCR_DIGIT_TRANSLATION)
+        if corrected.isdigit():
+            return corrected
+    # 出现明确的字母时按字母数字代码处理；竖线无法可靠判定为 I 或 1。
+    if COMPANY_CODE_PATTERN.fullmatch(company_code) is not None:
+        return company_code
+    return None
+
+
 def extract_transaction_number(text: str, pdf_name: str) -> str:
     matches = {
-        (match.group(1), match.group(2).upper(), match.group(3))
+        (
+            match.group(1),
+            match.group(2).upper(),
+            match.group(3),
+            match.group(4) or "",
+        )
         for match in TRANSACTION_PATTERN.finditer(text)
     }
     if len(matches) != 1:
         detail = "未识别到" if not matches else "识别到多个候选编号"
         raise ValueError(f"{pdf_name}: {detail}")
 
-    company_code, raw_trade_type, serial = matches.pop()
-    company_code = company_code.upper().translate(OCR_DIGIT_TRANSLATION)
+    raw_company_code, raw_trade_type, serial, raw_suffix = matches.pop()
+    company_code = normalize_company_code(raw_company_code)
     trade_type = normalize_trade_type(raw_trade_type, expected_trade_type(text))
     serial = serial.upper().translate(OCR_DIGIT_TRANSLATION)
+    suffix = raw_suffix.upper().translate(OCR_DIGIT_TRANSLATION)
     if (
-        not company_code.isdigit()
+        company_code is None
         or trade_type is None
         or not serial.isdigit()
+        or (suffix and not suffix.isdigit())
     ):
         raise ValueError(f"{pdf_name}: 交易编号包含无法安全纠正的字符")
-    return f"【HFSY】{company_code}-{trade_type}-{serial}"
+    suffix_text = f"-{suffix}" if suffix else ""
+    return f"【HFSY】{company_code}-{trade_type}-{serial}{suffix_text}"
 
 
 def build_plans(pdfs: list[Path], recognized: dict[Path, str]) -> list[RenamePlan]:
     plans: list[RenamePlan] = []
     errors: list[str] = []
-
     for source in pdfs:
         try:
-            transaction_number = extract_transaction_number(
-                recognized[source.resolve()], source.name
+            number = extract_transaction_number(
+                recognized[source.resolve()],
+                source.name,
             )
-            # 编号末尾 10 位是 YYYYMMDDNN，去掉最后 2 位得到 YYYYMMDD。
-            serial = transaction_number.rsplit("-", maxsplit=1)[1]
-            date_suffix = serial[-10:-2]
-            target = source.with_name(f"{transaction_number}{date_suffix}.pdf")
-            plans.append(RenamePlan(source, target, transaction_number))
+            # 主编号中的 10 位流水号是 YYYYMMDDNN；末尾可能还有 -1、-2
+            # 等项目分段，不能用最后一个短横线直接切流水号。
+            serial_match = re.search(r"-(\d{10})(?:-\d+)?$", number)
+            if serial_match is None:
+                raise ValueError(f"{source.name}: 无法从交易编号提取日期")
+            date_suffix = serial_match.group(1)[:-2]
+            target = source.with_name(f"{number}{date_suffix}.pdf")
+            plans.append(RenamePlan(source, target, number))
         except (KeyError, ValueError) as exc:
             errors.append(str(exc))
-
     if errors:
         raise RuntimeError("编号提取失败：\n  " + "\n  ".join(errors))
 
@@ -297,7 +204,6 @@ def build_plans(pdfs: list[Path], recognized: dict[Path, str]) -> list[RenamePla
         target_key = str(plan.target.resolve()).casefold()
         if plan.target.exists() and target_key not in source_keys:
             raise RuntimeError(f"目标文件已存在：{plan.target}")
-
     return plans
 
 
@@ -306,7 +212,6 @@ def apply_plans(plans: list[RenamePlan]) -> None:
     active = [plan for plan in plans if plan.source != plan.target]
     temporary: dict[RenamePlan, Path] = {}
     completed: list[RenamePlan] = []
-
     try:
         for plan in active:
             temp_path = plan.source.with_name(
@@ -314,7 +219,6 @@ def apply_plans(plans: list[RenamePlan]) -> None:
             )
             plan.source.rename(temp_path)
             temporary[plan] = temp_path
-
         for plan in active:
             temporary[plan].rename(plan.target)
             completed.append(plan)
@@ -329,13 +233,10 @@ def apply_plans(plans: list[RenamePlan]) -> None:
 
 
 def run_scan(pdf_folder: Path, preview: bool = False) -> tuple[int, int]:
-    """识别并重命名扫描件，返回（PDF 总数，实际改名数量）。"""
+    """识别并重命名拆分件，返回（PDF 总数，实际改名数量）。"""
     pdf_folder = pdf_folder.expanduser().resolve()
-    if sys.platform != "darwin":
-        raise RuntimeError("本脚本使用 macOS Vision OCR，需要在 Mac 上运行。")
     if not pdf_folder.is_dir():
         raise RuntimeError(f"找不到文件夹：{pdf_folder}")
-
     pdfs = collect_pdfs(pdf_folder)
     if not pdfs:
         raise RuntimeError(f"未在 {pdf_folder} 中找到 PDF。")
@@ -343,19 +244,16 @@ def run_scan(pdf_folder: Path, preview: bool = False) -> tuple[int, int]:
     print(f"正在识别 {len(pdfs)} 份 PDF 的首页，请稍候……")
     recognized = recognize_all(pdfs)
     plans = build_plans(pdfs, recognized)
-
     print()
     for number, plan in enumerate(plans, start=1):
         status = "（已是目标名称）" if plan.source == plan.target else ""
         print(f"{number:>3}. {plan.source.name}")
         print(f"     -> {plan.target.name}{status}")
-
     if preview:
         print(f"\n预览完成：共 {len(plans)} 份，未重命名任何文件。")
         return len(plans), 0
 
     apply_plans(plans)
-
     changed = sum(plan.source != plan.target for plan in plans)
     print(f"\n已完成：成功重命名 {changed} 份 PDF，PDF 内容未修改。")
     return len(plans), changed

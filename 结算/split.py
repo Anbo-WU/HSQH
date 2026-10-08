@@ -7,8 +7,8 @@
     ├── 远期镒链导出/远期了结记录导出YYYYMMDD.xls
     └── 老版本/远期了结记录导出01.xls ...
 
-累计到期表是二进制 .xls，需要 xlrd；远期了结记录导出表是 HTML
-格式的 .xls。输出仍保留为 HTML 格式 .xls，可供后续 update.py 处理。
+累计到期表及导出表支持二进制 .xls、.xlsx 和 HTML 表格。
+导出表按表头对齐原业务布局；输出仍保留 HTML .xls，供 update.py 处理。
 正式运行前会先将老版本的旧文件压缩归档，校验 zip 成功后再清空。
 """
 
@@ -25,10 +25,7 @@ from zoneinfo import ZoneInfo
 
 from workflow_utils import archive_and_clear
 
-try:
-    import xlrd
-except ImportError:  # 让缺少依赖时的提示比 Python traceback 更直接。
-    xlrd = None  # type: ignore[assignment]
+from table_io import export_html, find_one_file, read_sheets
 
 
 IDENTIFIER_RE = re.compile(r"【[^\r\n】]+】[A-Za-z0-9]+-JY-\d+")
@@ -105,22 +102,6 @@ def find_business_root(explicit: Path | None) -> Path:
     )
 
 
-def find_one_file(directory: Path, preferred_names: list[str], fallback: str) -> Path:
-    for name in preferred_names:
-        path = directory / name
-        if path.is_file():
-            return path
-
-    matches = sorted(path for path in directory.glob(fallback) if path.is_file())
-    if not matches:
-        expected = " 或 ".join(preferred_names)
-        raise FileNotFoundError(f"未在 {directory} 找到 {expected}")
-    if len(matches) > 1:
-        names = "、".join(path.name for path in matches)
-        raise RuntimeError(f"{directory} 中匹配到多个文件，无法确定使用哪个：{names}")
-    return matches[0]
-
-
 def extract_identifier(value: object) -> str | None:
     """从两种单元格文本中取统一的编号。
 
@@ -134,70 +115,27 @@ def extract_identifier(value: object) -> str | None:
 
 
 def read_due_items(path: Path) -> tuple[list[DueItem], str]:
-    if xlrd is None:
-        raise RuntimeError("缺少 xlrd，请先执行：python3 -m pip install xlrd==1.2.0")
-
-    try:
-        workbook = xlrd.open_workbook(str(path), on_demand=True)
-    except Exception as exc:
-        raise RuntimeError(f"无法读取累计到期表 {path}：{exc}") from exc
-
-    try:
-        usable_sheets = [sheet for sheet in workbook.sheets() if sheet.ncols >= 5]
-        if not usable_sheets:
-            raise RuntimeError("工作簿中没有至少 5 列的工作表")
-
-        # 如果有多个 sheet，选 C/E 列中有效编号数量最多的一张。
-        sheet = max(
-            usable_sheets,
-            key=lambda sh: sum(
-                bool(extract_identifier(sh.cell_value(row, 2)))
-                or bool(extract_identifier(sh.cell_value(row, 4)))
-                for row in range(sh.nrows)
-            ),
-        )
-
-        items: list[DueItem] = []
-        for row_index in range(sheet.nrows):
-            c_text = str(sheet.cell_value(row_index, 2)).strip()
-            e_text = str(sheet.cell_value(row_index, 4)).strip()
-            c_identifier = extract_identifier(c_text)
-            e_identifier = extract_identifier(e_text)
-
-            # 表头和纯空行不是待拆分数据。若 C/E 中任一格像编号，
-            # 或任一格包含“转远期明细表”，则保留该行以便报警。
-            looks_like_data = bool(c_identifier or e_identifier) or (
-                "转远期明细表" in c_text or "转远期明细表" in e_text
-            )
-            if not looks_like_data:
-                continue
-
-            items.append(
-                DueItem(
-                    excel_row=row_index + 1,
-                    identifier=c_identifier,  # 无论 C/E 是否一致，始终以 C 列为准。
-                    c_text=c_text,
-                    e_text=e_text,
-                )
-            )
-    finally:
-        workbook.release_resources()
-
+    sheets = [s for s in read_sheets(path) if s.ncols >= 5]
+    if not sheets:
+        raise RuntimeError("工作簿中没有至少 5 列的工作表")
+    sheet = max(sheets, key=lambda s: sum(
+        bool(extract_identifier(row[2])) or bool(extract_identifier(row[4]))
+        for row in s.rows if len(row) >= 5))
+    items = []
+    for row_index, row in enumerate(sheet.rows):
+        row = row + [''] * max(0, 5-len(row))
+        c_text, e_text = row[2].strip(), row[4].strip()
+        c_identifier, e_identifier = extract_identifier(c_text), extract_identifier(e_text)
+        if c_identifier or e_identifier or '转远期明细表' in c_text or '转远期明细表' in e_text:
+            items.append(DueItem(row_index+1, c_identifier, c_text, e_text))
     if not items:
         raise RuntimeError(f"{path.name} 的 C/E 列中没有找到待处理的编号")
     return items, sheet.name
 
 
 def decode_html_xls(path: Path) -> str:
-    raw = path.read_bytes()
-    for encoding in ("utf-8-sig", "utf-8", "gb18030"):
-        try:
-            text = raw.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-        if "<html" in text[:2000].lower() or "<table" in text[:5000].lower():
-            return text
-    raise RuntimeError(f"{path} 不是本程序支持的 HTML 格式 .xls 文件")
+    """兼容旧函数入口；实际按内容识别 XLS/XLSX/HTML，并按表头对齐。"""
+    return export_html(path)
 
 
 def parse_html_table(path: Path) -> HtmlTable:
@@ -375,6 +313,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="只检查匹配结果，不归档、不清理、不写入文件",
     )
+    parser.add_argument("--due-file", type=Path, help="明确指定累计到期表 .xls/.xlsx")
+    parser.add_argument("--export-file", type=Path, help="明确指定导出表 .xls/.xlsx")
     return parser
 
 
@@ -407,17 +347,18 @@ def main() -> int:
             business_root.resolve(),
             due_dir.resolve(),
             export_dir.resolve(),
+            *(p.expanduser().resolve().parent for p in (args.due_file, args.export_file) if p),
             archive_dir.resolve(),
         }
         if output_dir.resolve() in protected_dirs:
             raise ValueError(f"输出目录不能是业务根目录或源数据目录：{output_dir}")
 
-        due_path = find_one_file(
+        due_path = args.due_file.expanduser().resolve() if args.due_file else find_one_file(
             due_dir,
             [f"累计远期到期{date_mmdd}.xls", f"累计文件到期{date_mmdd}.xls"],
             f"*到期{date_mmdd}.xls",
         )
-        export_path = find_one_file(
+        export_path = args.export_file.expanduser().resolve() if args.export_file else find_one_file(
             export_dir,
             [f"远期了结记录导出{date_yyyymmdd}.xls"],
             f"远期了结记录导出*{date_yyyymmdd}*.xls",

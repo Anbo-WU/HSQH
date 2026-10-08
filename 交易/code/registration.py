@@ -44,7 +44,7 @@ REMOVE_PATTERN = re.compile(
 # 与 precheck.py 的 PDF 标准命名规则保持一致，但这里只校验文件主体，
 # 因而同一规则也可用于尚未转换为 PDF 的 .doc 和 .docx。
 STANDARD_CONFIRMATION_STEM = re.compile(
-    r"^.+_商品交易确认书_【HFSY】\d{4}-(?:JY|FWJY)-\d{10}$"
+    r"^.+_商品交易确认书_【HFSY】[A-Z0-9]{4}-(?:JY|FWJY)-\d{10}$"
 )
 
 
@@ -406,7 +406,7 @@ def run_registration(
             file=sys.stderr,
         )
         print(
-            "标准格式：公司名称_商品交易确认书_【HFSY】四位编号-"
+            "标准格式：公司名称_商品交易确认书_【HFSY】四位数字或字母编号-"
             "JY或FWJY-八位日期两位流水号.doc/.docx",
             file=sys.stderr,
         )

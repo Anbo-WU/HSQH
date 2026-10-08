@@ -15,10 +15,7 @@ from zoneinfo import ZoneInfo
 
 from workflow_utils import archive_and_clear, create_archive
 
-try:
-    import xlrd
-except ImportError:
-    xlrd = None  # type: ignore[assignment]
+from table_io import export_html, find_one_file, read_sheets, spreadsheet_files
 
 
 DELETE_COLUMNS = {2, 5, 23, 24, 25, 26, 27, 29}  # C/F/X/Y/Z/AA/AB/AD
@@ -80,21 +77,6 @@ def find_business_root(explicit: Path | None) -> Path:
     )
 
 
-def find_one_file(directory: Path, preferred_names: list[str], fallback: str) -> Path:
-    for name in preferred_names:
-        path = directory / name
-        if path.is_file():
-            return path
-    matches = sorted(path for path in directory.glob(fallback) if path.is_file())
-    if not matches:
-        expected = " 或 ".join(preferred_names)
-        raise FileNotFoundError(f"未在 {directory} 找到 {expected}")
-    if len(matches) > 1:
-        names = "、".join(path.name for path in matches)
-        raise RuntimeError(f"{directory} 中匹配到多个文件：{names}")
-    return matches[0]
-
-
 def extract_identifier(value: object) -> str | None:
     match = IDENTIFIER_RE.search(str(value).strip())
     return match.group(0).strip() if match else None
@@ -151,13 +133,7 @@ def safe_name_part(value: str) -> str:
 
 
 def transform(source: Path, output_dir: Path) -> TransformResult:
-    raw = source.read_bytes()
-    if not raw.lstrip().lower().startswith((b"<html", b"<!doctype html")):
-        raise ValueError("不是本工具支持的 HTML 格式 .xls 文件")
-    try:
-        text = raw.decode("utf-8-sig")
-    except UnicodeDecodeError as exc:
-        raise ValueError("文件不是 UTF-8 编码的 HTML 格式 .xls") from exc
+    text = export_html(source)
 
     table_match = re.search(r"<table\b[^>]*>.*?</table\s*>", text, re.I | re.S)
     if not table_match:
@@ -244,7 +220,9 @@ def transform(source: Path, output_dir: Path) -> TransformResult:
     if not customer or not reference:
         raise ValueError("B2 或 AC2 内容不足，无法生成新文件名")
     output_dir.mkdir(parents=True, exist_ok=True)
-    destination = output_dir / f"{customer}{reference}{source.stem}{source.suffix}"
+    destination = output_dir / f"{customer}{reference}{source.stem}.xls"
+    if destination.exists():
+        raise FileExistsError(f"输出文件已存在，未覆盖：{destination}")
     destination.write_text(result_text, encoding="utf-8")
     return TransformResult(source, destination, identifier)
 
@@ -268,44 +246,28 @@ def read_final_s_total(path: Path) -> Decimal:
 
 
 def read_company_totals(path: Path) -> tuple[dict[str, Decimal], str]:
-    """按 C 列标志符建立累计到期表 I 列数值索引。"""
-    if xlrd is None:
-        raise RuntimeError("缺少 xlrd，请先执行：python3 -m pip install xlrd==1.2.0")
-    try:
-        workbook = xlrd.open_workbook(str(path), on_demand=True)
-    except Exception as exc:
-        raise RuntimeError(f"无法读取累计到期表 {path}：{exc}") from exc
-
-    try:
-        usable_sheets = [sheet for sheet in workbook.sheets() if sheet.ncols >= 9]
-        if not usable_sheets:
-            raise RuntimeError("工作簿中没有至少 9 列的工作表")
-        sheet = max(
-            usable_sheets,
-            key=lambda sh: sum(
-                bool(extract_identifier(sh.cell_value(row, 2)))
-                for row in range(sh.nrows)
-            ),
-        )
-        totals: dict[str, Decimal] = {}
-        for row_index in range(sheet.nrows):
-            identifier = extract_identifier(sheet.cell_value(row_index, 2))
-            if identifier is None:
-                continue
-            raw_value = str(sheet.cell_value(row_index, 8)).strip()
-            if not raw_value:
-                raise ValueError(f"{path.name} I{row_index + 1} 为空")
-            value = decimal_value(raw_value, location=f"{path.name} I{row_index + 1}")
-            if identifier in totals:
-                raise ValueError(f"累计到期表 C 列存在重复标志符：{identifier}")
-            totals[identifier] = value
-        sheet_name = sheet.name
-    finally:
-        workbook.release_resources()
-
+    """按 C 列标志符建立累计到期表 I 列数值索引；支持 XLS/XLSX/HTML。"""
+    sheets = [s for s in read_sheets(path) if s.ncols >= 9]
+    if not sheets:
+        raise RuntimeError("工作簿中没有至少 9 列的工作表")
+    sheet = max(sheets, key=lambda s: sum(bool(extract_identifier(r[2])) for r in s.rows if len(r) >= 3))
+    totals = {}
+    identifier_rows = {}
+    for row_index, row in enumerate(sheet.rows):
+        row = row + [''] * max(0, 9-len(row))
+        identifier = extract_identifier(row[2])
+        if identifier is None:
+            continue
+        raw_value = row[8].strip()
+        if not raw_value:
+            raise ValueError(f"{path.name} I{row_index+1} 为空")
+        if identifier in totals:
+            raise ValueError(f"累计到期表 {path.name} 第 {identifier_rows[identifier]}、{row_index+1} 行 C 列存在重复标志符：{identifier}；请核对重复录入或多笔业务，程序不会自动去重或累加")
+        totals[identifier] = decimal_value(raw_value, location=f"{path.name} I{row_index+1}")
+        identifier_rows[identifier] = row_index+1
     if not totals:
         raise ValueError(f"{path.name} 中未找到可用的 C/I 列数据")
-    return totals, sheet_name
+    return totals, sheet.name
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -326,6 +288,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="最终压缩包交付目录，默认为当前用户桌面",
     )
+    parser.add_argument("--due-file", type=Path, help="明确指定累计到期表 .xls/.xlsx")
     return parser
 
 
@@ -368,16 +331,20 @@ def main() -> int:
             (business_root / "累计远期到期").resolve(),
             input_dir.resolve(),
             archive_dir.resolve(),
+            *(p.expanduser().resolve().parent for p in (args.due_file,) if p),
         }
         if output_dir.resolve() in protected_dirs:
             raise ValueError(f"新版本输出目录不安全：{output_dir}")
 
-        sources = sorted(path for path in input_dir.glob("*.xls") if path.is_file())
+        sources = spreadsheet_files(input_dir)
         if not sources:
-            raise FileNotFoundError(f"未在 {input_dir} 找到 .xls 文件")
+            raise FileNotFoundError(f"未在 {input_dir} 找到 .xls/.xlsx 文件")
+
+        if len({p.stem.casefold() for p in sources}) != len(sources):
+            raise ValueError("老版本目录存在同名的 .xls/.xlsx，请只保留一个输入版本，避免重复处理")
 
         due_dir = business_root / "累计远期到期"
-        due_path = find_one_file(
+        due_path = args.due_file.expanduser().resolve() if args.due_file else find_one_file(
             due_dir,
             [f"累计远期到期{date_mmdd}.xls", f"累计文件到期{date_mmdd}.xls"],
             f"*到期{date_mmdd}.xls",
